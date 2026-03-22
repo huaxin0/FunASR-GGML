@@ -1,0 +1,25 @@
+# Build
+build/
+cmake-build-*/
+
+# Model files (too large for git)
+*.bin
+*.gguf
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary
+/tmp/
+*.o
+*.a
+*.so
+*.dylib*.wav 
