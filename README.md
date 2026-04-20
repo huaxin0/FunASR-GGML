@@ -1,7 +1,5 @@
 # FunASR-GGML
 
-C++ speech recognition inference engine using [GGML](https://github.com/ggerganov/ggml), powered by FunASR's SenseVoice architecture.
-
 **Audio → Text**, fully local, no Python, no server.
 
 ## Features
