@@ -147,7 +147,7 @@ python hf_convert_ggml_q8.py --model-dir <huggingface_model> --output FunAsr_q8.
 
 ## Performance
 
-Tested on RTX 4070 Laptop GPU + i7-13700H:
+Tested on RTX 4070 Laptop GPU + AMD-7745H:
 
 | Mode | Prefill (116 tok) | Decode Speed | RTF (realtime) |
 | ---- | ----------------- | ------------ | -------------- |
