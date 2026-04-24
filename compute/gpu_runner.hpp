@@ -85,6 +85,61 @@ public:
         int n_past,
         std::vector<float>& logits_out
     ) {
+        return forward_impl(input_embeds, nullptr, seq_len, n_past, logits_out);
+    }
+
+    // ============================================================
+    // Forward (GPU tensor 输入): 直接接受 GPU 上的 tensor
+    //
+    // gpu_embeds:   GPU 上的 [embed_dim, seq_len] tensor
+    //               从 GPUEncoderAdaptorRunner::forward_on_gpu() 获得
+    // 其余参数同上
+    // ============================================================
+    bool forward_gpu_tensor(
+        ggml_tensor* gpu_embeds,
+        int seq_len,
+        int n_past,
+        std::vector<float>& logits_out
+    ) {
+        return forward_impl(nullptr, gpu_embeds, seq_len, n_past, logits_out);
+    }
+
+    // 简单 argmax
+    static int argmax(const std::vector<float>& logits) {
+        float max_val = -1e30f;
+        int max_idx = 0;
+        for (size_t i = 0; i < logits.size(); i++) {
+            if (logits[i] > max_val) {
+                max_val = logits[i];
+                max_idx = static_cast<int>(i);
+            }
+        }
+        return max_idx;
+    }
+
+    bool is_warmed_up() const { return warmed_up_; }
+
+private:
+    GPUContext& gpu_ctx_;
+    ggml_gallocr_t allocr_prefill_ = nullptr;
+    ggml_gallocr_t allocr_decode_  = nullptr;
+    std::vector<int> pos_data_;
+    bool warmed_up_ = false;
+
+    // ============================================================
+    // 统一的 forward 实现
+    //
+    // cpu_embeds:  非 null 时从 CPU 拷入 (传统路径)
+    // gpu_embeds:  非 null 时从 GPU tensor 拷入 (GPU-resident 路径)
+    // 两者互斥，gpu_embeds 优先
+    // ============================================================
+    bool forward_impl(
+        const float* cpu_embeds,
+        ggml_tensor* gpu_embeds,
+        int seq_len,
+        int n_past,
+        std::vector<float>& logits_out
+    ) {
         const auto& cfg = gpu_ctx_.config();
         const int embed_dim  = cfg.embedding_length;
         const int vocab_size = cfg.vocab_size;
@@ -137,12 +192,17 @@ public:
             return false;
         }
 
-        // ===== 5. 设置输入数据 (CPU → GPU) =====
-        ggml_backend_tensor_set(input, input_embeds, 0,
-                                 embed_dim * seq_len * sizeof(float));
+        // ===== 5. 设置输入数据 =====
+        if (gpu_embeds) {
+            // GPU→GPU: 数据已在 GPU 上
+            ggml_backend_tensor_copy(gpu_embeds, input);
+        } else if (cpu_embeds) {
+            // CPU→GPU: 传统路径
+            ggml_backend_tensor_set(input, cpu_embeds, 0,
+                                     embed_dim * seq_len * sizeof(float));
+        }
 
         // ===== 6. 设置 RoPE position tensor =====
-        // GPU 模式下 pos->data 是 NULL，需要遍历图找 ROPE 节点
         for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
             ggml_tensor* node = ggml_graph_node(graph, i);
             if (node->op == GGML_OP_ROPE) {
@@ -174,28 +234,6 @@ public:
         ggml_free(ctx);
         return true;
     }
-
-    // 简单 argmax
-    static int argmax(const std::vector<float>& logits) {
-        float max_val = -1e30f;
-        int max_idx = 0;
-        for (size_t i = 0; i < logits.size(); i++) {
-            if (logits[i] > max_val) {
-                max_val = logits[i];
-                max_idx = static_cast<int>(i);
-            }
-        }
-        return max_idx;
-    }
-
-    bool is_warmed_up() const { return warmed_up_; }
-
-private:
-    GPUContext& gpu_ctx_;
-    ggml_gallocr_t allocr_prefill_ = nullptr;
-    ggml_gallocr_t allocr_decode_  = nullptr;
-    std::vector<int> pos_data_;
-    bool warmed_up_ = false;
 };
 
 } // namespace funasr

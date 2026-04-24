@@ -151,7 +151,6 @@ ggml_tensor* sanm_attention_forward(
                                           cfg.kernel_size, cfg.fsmn_pad());
 
     // ===== Multi-head reshape + permute =====
-    // 从投影后的维度推导 head_dim (不硬编码)
     int qk_dim     = static_cast<int>(q->ne[0]);
     int head_dim   = qk_dim / n_heads;
     int v_dim      = static_cast<int>(v->ne[0]);

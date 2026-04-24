@@ -19,6 +19,7 @@
 #ifdef FUNASR_USE_CUDA
 #include "compute/gpu_context.hpp"
 #include "compute/gpu_runner.hpp"
+#include "compute/encoder_adaptor_gpu.hpp"
 #endif
 #include <string>
 #include <vector>
@@ -108,9 +109,10 @@ private:
         const float* adaptor_data, int audio_frames,
         const InferenceConfig& config, TokenCallback callback);
 
-    // GPU 推理路径
+    // GPU 推理路径 (adaptor 数据在 GPU 上)
     InferenceResult run_gpu(
-        const float* adaptor_data, int audio_frames,
+        ggml_tensor* gpu_adaptor_tensor, int audio_frames,
+        const float* cpu_adaptor_data,   // fallback: 没有 GPU tensor 时用
         const InferenceConfig& config, TokenCallback callback);
 
     static int argmax(const float* logits, int vocab_size);
@@ -118,6 +120,17 @@ private:
 #ifdef FUNASR_USE_CUDA
     std::unique_ptr<GPUContext> gpu_ctx_;
     std::unique_ptr<GPURunner>  gpu_runner_;
+    std::unique_ptr<GPUEncoderAdaptorRunner> gpu_ea_runner_;
+
+    // Prefill staging: 持久化的 GPU tensor 用于拼接 inputs_embeds
+    // 避免每次推理都 alloc/free
+    ggml_context* prefill_stg_ctx_ = nullptr;
+    ggml_backend_buffer_t prefill_stg_buf_ = nullptr;
+    ggml_tensor* prefill_stg_tensor_ = nullptr;
+    int prefill_stg_max_len_ = 0;  // 当前 staging 能容纳的最大 total_len
+
+    bool ensure_prefill_staging(int total_len, int embed_dim);
+    void free_prefill_staging();
 #endif
 };
 

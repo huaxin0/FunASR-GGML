@@ -117,11 +117,8 @@ public:
         if (!kv_cache_.initialized) return;
         kv_cache_.n_past = 0;
 
-        size_t n_elements = static_cast<size_t>(kv_cache_.kv_dim)
-                          * kv_cache_.n_ctx * kv_cache_.n_layers;
-        std::vector<float> zeros(n_elements, 0.0f);
-        ggml_backend_tensor_set(kv_cache_.k, zeros.data(), 0, n_elements * sizeof(float));
-        ggml_backend_tensor_set(kv_cache_.v, zeros.data(), 0, n_elements * sizeof(float));
+        // 直接在 GPU 上清零，避免分配 ~224MB CPU 临时内存再传输
+        ggml_backend_buffer_clear(kv_cache_.buffer, 0);
     }
 
     // ============================================================
@@ -342,10 +339,8 @@ private:
             return false;
         }
 
-        // 清零
-        std::vector<float> zeros(n_elements, 0.0f);
-        ggml_backend_tensor_set(kv_cache_.k, zeros.data(), 0, n_elements * sizeof(float));
-        ggml_backend_tensor_set(kv_cache_.v, zeros.data(), 0, n_elements * sizeof(float));
+        // 清零 — 直接在 GPU 上
+        ggml_backend_buffer_clear(kv_cache_.buffer, 0);
 
         kv_cache_.initialized = true;
         printf("[GPUContext] KV Cache: K=%.1f MB, V=%.1f MB\n",
