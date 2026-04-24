@@ -33,21 +33,22 @@ WAV / Mic (16kHz mono)
 
 | Implementation | CER (%) | Quantization |
 |---|---|---|
-| Fun-ASR-nano (official, PyTorch) | 1.80 | FP16 |
+| Fun-ASR-nano (official paper) | 1.80 | FP16 |
+| Fun-ASR-nano (official Python, this machine) | 1.91 | FP16 |
 | **FunASR-GGML (this project)** | **1.98** | **Q8_0** |
 
 CER evaluated with digit normalization (阿拉伯数字→中文数字) and punctuation removal.
 
 ### Speed — RTX 4070 Laptop GPU + AMD Ryzen 7 7745HX
 
-| Metric | Value |
-|---|---|
-| Total files | 7176 |
-| Avg latency per file | 221 ms |
-| Throughput | 4.5 files/sec |
-| RTF | ~0.044 (≈23× realtime) |
-| Encoder + Adaptor (GPU) | ~40 ms |
-| LLM Prefill + Decode (GPU) | ~180 ms |
+| Metric | Official Python (PyTorch) | C++ GGML Q8 | Speedup |
+|---|---|---|---|
+| Avg latency | 1753 ms | 221 ms | **7.9×** |
+| Throughput | 0.6 files/sec | 4.5 files/sec | **7.5×** |
+| RTF | 0.348 | 0.044 | **7.9×** |
+| Total time (7176 files) | 12594 sec (3.5h) | 1586 sec (26min) | **7.9×** |
+
+Both tested on the same machine, same GPU, same test set, no VAD.
 
 Staging buffers allocated once at warmup; no per-inference GPU memory allocation.
 
