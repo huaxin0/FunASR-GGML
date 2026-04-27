@@ -1,30 +1,95 @@
 # FunASR-GGML
 
-C++ speech recognition inference engine using [GGML](https://github.com/ggerganov/ggml), powered by [Fun-ASR-Nano](https://github.com/FunAudioLLM/Fun-ASR) (0.8B).
+High-accuracy Chinese offline ASR in pure C++: Fun-ASR-Nano on GGML, no Python, no server.
 
-**Audio → Text**, fully local, no Python, no server.
+**7.9× faster than official PyTorch** | **CER 1.98% on AISHELL-1** | **Single binary + single model file**
 
 ## Features
 
 - **Pure C++17** — no Python runtime, no framework dependencies
 - **GGUF model format** — single file contains weights + tokenizer + config
-- **Full GPU pipeline** — Encoder, Adaptor, and LLM all run on CUDA GPU with GPU-resident data path
+- **Full GPU pipeline** — Encoder, Adaptor, and LLM all run on CUDA GPU
 - **CPU fallback** — runs entirely on CPU when CUDA is unavailable
+- **CLI tool** — `funasr-cli` for file transcription, batch processing, SRT subtitles
+- **Long audio** — Silero VAD segmentation + punctuation-based subtitle splitting
+- **Multiple formats** — WAV, MP3, FLAC input; TXT, SRT, TSV output
 - **Real-time microphone** — VAD-based streaming recognition with [miniaudio](https://github.com/mackron/miniaudio)
 - **~985M parameters** — Audio Encoder (SANM 70L) + Audio Adaptor (2L) + LLM Decoder (Qwen3-0.6B 28L)
 
-## Architecture
+## Quick Start
+
+```bash
+# 1. Build
+git clone --recursive https://github.com/huaxin0/FunASR-GGML.git
+cd FunASR-GGML && mkdir build && cd build
+cmake .. -DFUNASR_CUDA=ON    # or just `cmake ..` for CPU-only
+make -j$(nproc)
+
+# 2. Download models
+wget https://huggingface.co/huaxin0x/funasr-ggml-models/resolve/main/FunAsr_q8.bin
+wget https://huggingface.co/huaxin0x/funasr-ggml-models/resolve/main/ggml-silero-v6.2.0.bin
+
+# 3. Transcribe
+./funasr-cli -m FunAsr_q8.bin -f audio.wav --gpu
+```
+
+## CLI Usage
+
+```bash
+# Basic transcription (output to terminal)
+funasr-cli -m FunAsr_q8.bin -f audio.wav --gpu
+
+# Output SRT subtitles
+funasr-cli -m FunAsr_q8.bin -f audio.wav --gpu -osrt
+
+# Long audio with Silero VAD + SRT
+funasr-cli -m FunAsr_q8.bin -f meeting.mp3 --gpu --vad \
+  --vad-model ggml-silero-v6.2.0.bin \
+  --vad-threshold 0.45 --vad-min-silence-ms 600 \
+  --vad-max-speech-sec 10 --max-tokens 120 \
+  -o meeting.srt
+
+# Batch transcribe a directory (TSV for CER evaluation)
+funasr-cli -m FunAsr_q8.bin -f ~/data_aishell/wav/test -otsv --gpu -o results.tsv
+
+# CPU mode (no --gpu flag)
+funasr-cli -m FunAsr_q8.bin -f audio.wav
+```
+
+### CLI Options
 
 ```
-WAV / Mic (16kHz mono)
-  → Fbank (80-dim mel + LFR) → [560, T]                              CPU
-  → Audio Encoder (50 SANM + 20 TP layers, FSMN) → [512, T]          GPU ★
-  → Audio Adaptor (linear + 2 attention blocks) → [1024, T]          GPU ★
-  → LLM Decoder (28-layer Qwen3, GQA, RoPE, KV Cache) → logits      GPU ★
-  → BPE Decode → Text
+Required:
+  -m, --model <path>        Model file (GGUF format)
+  -f, --file <path>         Input audio file or directory
 
-★ GPU-resident path: data stays on GPU between Encoder → Adaptor → LLM.
-  Only fbank input (CPU→GPU) and logits output (GPU→CPU) cross PCIe.
+Output:
+  -otxt                     Plain text (.txt)
+  -osrt                     SRT subtitles (.srt)
+  -otsv                     TSV format (utt_id<TAB>text)
+  -o, --output <path>       Output file (format inferred by extension)
+  --srt-max-chars <n>       Max chars per subtitle line (default: 20)
+
+GPU:
+  --gpu                     Enable GPU inference
+  --gpu-id <id>             CUDA device ID (default: 0)
+
+Long audio (Silero VAD):
+  --vad                     Enable VAD segmentation
+  --vad-model <path>        Silero VAD model file (recommended)
+  --vad-threshold <f>       Speech probability threshold (default: 0.5)
+  --vad-min-silence-ms <n>  Min silence to split (default: 100)
+  --vad-max-speech-sec <f>  Max segment duration (default: 30)
+  --vad-speech-pad-ms <n>   Padding around segments (default: 30)
+
+Long audio (energy VAD, no model needed):
+  --vad                     Enable energy VAD (when no --vad-model)
+  --max-segment-sec <n>     Max segment seconds (default: 5)
+  --min-silence-ms <n>      Min silence to split (default: 600)
+
+Other:
+  -t, --threads <n>         CPU threads (default: 4)
+  --max-tokens <n>          Max generated tokens (default: 100)
 ```
 
 ## Benchmark
@@ -34,7 +99,7 @@ WAV / Mic (16kHz mono)
 | Implementation | CER (%) | Quantization |
 |---|---|---|
 | Fun-ASR-nano (official paper) | 1.80 | FP16 |
-| Fun-ASR-nano (official Python, this machine) | 1.91 | FP16 |
+| Fun-ASR-nano (official Python, same machine) | 1.91 | FP16 |
 | **FunASR-GGML (this project)** | **1.98** | **Q8_0** |
 
 CER evaluated with digit normalization (阿拉伯数字→中文数字) and punctuation removal.
@@ -48,43 +113,23 @@ CER evaluated with digit normalization (阿拉伯数字→中文数字) and punc
 | RTF | 0.348 | 0.044 | **7.9×** |
 | Total time (7176 files) | 12594 sec (3.5h) | 1586 sec (26min) | **7.9×** |
 
-Both tested on the same machine, same GPU, same test set, no VAD.
+Same machine, same GPU, same test set, no VAD.
 
-Staging buffers allocated once at warmup; no per-inference GPU memory allocation.
+## Architecture
 
-## Quick Start
-
-### Build (CPU only)
-
-```bash
-git clone --recursive https://github.com/huaxin0/FunASR-GGML.git
-cd FunASR-GGML
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
 ```
+Audio (WAV/MP3/FLAC, any sample rate)
+  → miniaudio decode + resample to 16kHz mono
+  → [Optional] Silero VAD segmentation (CPU, 860KB model)
+  → Fbank (80-dim mel + LFR) → [560, T]                              CPU
+  → Audio Encoder (50 SANM + 20 TP layers, FSMN) → [512, T]          GPU ★
+  → Audio Adaptor (linear + 2 attention blocks) → [1024, T]          GPU ★
+  → LLM Decoder (28-layer Qwen3, GQA, RoPE, KV Cache) → logits      GPU ★
+  → BPE Decode → Text
+  → [Optional] Punctuation-based subtitle splitting → SRT
 
-### Build (with CUDA GPU)
-
-```bash
-cmake .. -DFUNASR_CUDA=ON
-make -j$(nproc)
-```
-
-### Run
-
-```bash
-# File transcription (CPU)
-./test_pipeline ../FunAsr_q8.bin audio.wav
-
-# File transcription (GPU)
-./test_gpu ../FunAsr_q8.bin audio.wav
-
-# Batch benchmark
-./test_benchmark ../FunAsr_q8.bin ~/data_aishell/wav/test results.txt --gpu
-
-# Real-time microphone
-./test_realtime ../FunAsr_q8.bin --gpu
+★ GPU-resident path: data stays on GPU between Encoder → Adaptor → LLM.
+  Only fbank input (CPU→GPU) and logits output (GPU→CPU) cross PCIe.
 ```
 
 ## C++ API
@@ -109,7 +154,7 @@ int main() {
 ```cpp
 funasr::Recognizer recognizer;
 recognizer.init("FunAsr_q8.bin");
-recognizer.init_gpu();  // Uploads weights + warmup
+recognizer.init_gpu();
 
 funasr::InferenceConfig config;
 config.use_gpu = true;
@@ -128,47 +173,21 @@ auto result = recognizer.transcribe("audio.wav", config,
 );
 ```
 
-### Real-time microphone
-
-```cpp
-#include "pipeline/recognizer.hpp"
-#include "pipeline/audio_capture.hpp"
-#include "pipeline/realtime.hpp"
-
-funasr::Recognizer recognizer;
-recognizer.init("FunAsr_q8.bin");
-recognizer.init_gpu();
-
-funasr::AudioCapture mic;
-funasr::RealtimeRecognizer realtime(recognizer);
-
-mic.set_callback([&](const float* samples, size_t count) {
-    realtime.feed_audio(samples, count);
-});
-
-funasr::RealtimeConfig rt_config;
-rt_config.inference.use_gpu = true;
-
-realtime.start(rt_config, [](int id, const std::string& text, float sec, float ms) {
-    printf("[%d] %s (%.1fs, %.0fms)\n", id, text.c_str(), sec, ms);
-});
-
-mic.init();
-mic.start();
-// ... Ctrl+C to stop ...
-mic.stop();
-realtime.stop();
-```
-
 ## Model
 
-The model file `FunAsr_q8.bin` is in GGUF format containing:
+| File | Size | Description |
+|---|---|---|
+| `FunAsr_q8.bin` | 1.2 GB | ASR model (Q8_0 quantized, 1541 tensors) |
+| `ggml-silero-v6.2.0.bin` | 860 KB | Silero VAD model (optional, for long audio) |
 
-- 1541 tensors (~985M parameters, Q8_0 quantized)
-- BPE tokenizer (151936 tokens)
-- Architecture config (all hyperparameters)
+Download from [HuggingFace](https://huggingface.co/huaxin0x/funasr-ggml-models):
 
-### Convert from HuggingFace
+```bash
+wget https://huggingface.co/huaxin0x/funasr-ggml-models/resolve/main/FunAsr_q8.bin
+wget https://huggingface.co/huaxin0x/funasr-ggml-models/resolve/main/ggml-silero-v6.2.0.bin
+```
+
+### Convert from HuggingFace (optional)
 
 ```bash
 python hf_convert_ggml_q8.py --model-dir <huggingface_model> --output FunAsr_q8.bin
@@ -176,18 +195,19 @@ python hf_convert_ggml_q8.py --model-dir <huggingface_model> --output FunAsr_q8.
 
 ## GPU Pipeline Details
 
-The GPU inference path is optimized to minimize PCIe transfers:
-
 - **KV Cache clear**: `ggml_backend_buffer_clear` on GPU, no CPU-side allocation
-- **Encoder → Adaptor**: GPU-to-GPU staging buffer, no round-trip
-- **Adaptor → LLM**: GPU-resident prefill staging with `ggml_cpy` graph for device-to-device copy
-- **Buffer reuse**: Staging buffers allocated at warmup (max size), reused across inferences via partial `tensor_set`/`tensor_copy`
-- **Separate compute graphs**: Encoder and Adaptor use independent `ggml_gallocr` instances (merged graph is slower due to gallocr planning overhead on 70+ layer graphs)
+- **Encoder → Adaptor**: GPU-to-GPU staging buffer, no PCIe round-trip
+- **Adaptor → LLM**: GPU-resident prefill staging with `ggml_cpy` graph
+- **Buffer reuse**: Staging buffers allocated at warmup, reused across inferences
+- **GPU dither**: Automatic low-amplitude dither prevents GPU encoder NaN on near-silent audio
+- **Separate compute graphs**: Encoder and Adaptor use independent `ggml_gallocr` (merged graph is slower)
 
 ## Project Structure
 
 ```
 FunASR-GGML/
+├── cli/                     # Command-line tool
+│   └── funasr_cli.cpp       #   funasr-cli: transcribe, SRT, batch
 ├── core/                    # Config, GGUF reader
 │   ├── config.hpp           #   All params from GGUF metadata
 │   └── gguf_reader.hpp      #   RAII GGUF lifecycle
@@ -206,6 +226,7 @@ FunASR-GGML/
 │   ├── llm_ops_gpu.hpp/.cpp #   28-layer Qwen3 (GPU path)
 │   ├── gpu_runner.hpp       #   GPU graph executor (gallocr)
 │   ├── encoder_adaptor_gpu.hpp  # GPU encoder/adaptor with staging
+│   ├── silero_vad.hpp/.cpp  #   Silero VAD (ggml, from whisper.cpp)
 │   └── graph_runner.hpp     #   CPU graph executor
 ├── pipeline/                # User-facing API
 │   ├── prompt_builder.hpp   #   ChatML prompt construction
@@ -232,7 +253,7 @@ FunASR-GGML/
 - CMake 3.14+
 - GGML (included as submodule)
 - CUDA Toolkit 11+ (optional, for GPU)
-- miniaudio.h (included, for microphone)
+- miniaudio.h (included, for audio decoding and microphone)
 
 ## License
 
@@ -242,6 +263,7 @@ MIT
 
 - [GGML](https://github.com/ggerganov/ggml) — Tensor computation library
 - [Fun-ASR](https://github.com/FunAudioLLM/Fun-ASR) / [FunASR](https://github.com/modelscope/FunASR) — Original speech recognition model and toolkit
-- [whisper.cpp](https://github.com/ggerganov/whisper.cpp) — Reference for GGML-based ASR implementation patterns
+- [whisper.cpp](https://github.com/ggml-org/whisper.cpp) — Silero VAD ggml implementation and GGML-based ASR patterns
+- [Silero VAD](https://github.com/snakers4/silero-vad) — Voice Activity Detection model (MIT)
 - [zjkhahah/tokenizer-json](https://github.com/zjkhahah/tokenizer-json) — HuggingFace tokenizer JSON reader for C++
 - [miniaudio](https://github.com/mackron/miniaudio) — Cross-platform audio I/O
