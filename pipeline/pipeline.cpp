@@ -14,6 +14,8 @@
 #include "compute/llm_ops.hpp"
 #include "compute/graph_runner.hpp"
 #include <ggml.h>
+#include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <cstdio>
 #include <memory>
@@ -29,6 +31,29 @@ struct GgmlContextDeleter {
 };
 
 using PipelineGgmlContextPtr = std::unique_ptr<ggml_context, GgmlContextDeleter>;
+
+void add_gpu_dither(std::vector<float>& samples, uint32_t seed) {
+    constexpr float amplitude = 0.0005f;
+    uint32_t state = seed ? seed : 1u;
+    for (float& sample : samples) {
+        state = state * 1664525u + 1013904223u;
+        float u = static_cast<float>((state >> 8) & 0x00FFFFFF) / 16777215.0f;
+        float noise = (u * 2.0f - 1.0f) * amplitude;
+        sample = std::max(-1.0f, std::min(1.0f, sample + noise));
+    }
+}
+
+const float* prepare_audio_for_fbank(const float* audio, size_t n_samples,
+                                     bool use_gpu_dither,
+                                     std::vector<float>& scratch) {
+    if (!use_gpu_dither || !audio || n_samples == 0) {
+        return audio;
+    }
+
+    scratch.assign(audio, audio + n_samples);
+    add_gpu_dither(scratch, 0x46554E41u);
+    return scratch.data();
+}
 
 } // namespace
 
@@ -523,9 +548,25 @@ InferenceResult Pipeline::transcribe(
     TokenCallback callback
 ) {
     FbankProcessor fbank(model_.config.frontend);
+    std::vector<float> audio;
+    int wav_sr = 0;
+    if (!fbank.read_wav(wav_path, audio, wav_sr)) {
+        printf("[Pipeline] ERROR: fbank failed for '%s'\n", wav_path.c_str());
+        return InferenceResult{};
+    }
+
+    if (wav_sr != model_.config.frontend.sample_rate) {
+        printf("[Fbank] WARNING: WAV sample rate %d != expected %d, no resampling\n",
+               wav_sr, model_.config.frontend.sample_rate);
+    }
+
+    std::vector<float> audio_scratch;
+    const float* audio_for_fbank = prepare_audio_for_fbank(
+        audio.data(), audio.size(), config.use_gpu && is_gpu_ready(), audio_scratch);
+
     std::vector<float> fbank_data;
     int T, D;
-    if (!fbank.process_wav(wav_path, fbank_data, T, D)) {
+    if (!fbank.process(audio_for_fbank, audio.size(), fbank_data, T, D)) {
         printf("[Pipeline] ERROR: fbank failed for '%s'\n", wav_path.c_str());
         return InferenceResult{};
     }
@@ -538,9 +579,13 @@ InferenceResult Pipeline::transcribe_audio(
     TokenCallback callback
 ) {
     FbankProcessor fbank(model_.config.frontend);
+    std::vector<float> audio_scratch;
+    const float* audio_for_fbank = prepare_audio_for_fbank(
+        audio, n_samples, config.use_gpu && is_gpu_ready(), audio_scratch);
+
     std::vector<float> fbank_data;
     int T, D;
-    if (!fbank.process(audio, n_samples, fbank_data, T, D)) {
+    if (!fbank.process(audio_for_fbank, n_samples, fbank_data, T, D)) {
         printf("[Pipeline] ERROR: fbank failed\n");
         return InferenceResult{};
     }
