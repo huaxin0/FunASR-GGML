@@ -24,3 +24,7 @@ Thumbs.db
 *.so
 *.dylib*.wav 
 *.wav 
+FunAsr_q8.zip 
+__pycache__/ 
+*.pyc 
+build/ 
