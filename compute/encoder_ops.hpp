@@ -9,7 +9,6 @@
 //           → tp_norm
 //           → [512, T]
 //
-// 所有参数从 EncoderConfig 读取，不硬编码。
 //
 #ifndef FUNASR_COMPUTE_ENCODER_OPS_HPP
 #define FUNASR_COMPUTE_ENCODER_OPS_HPP
