@@ -7,9 +7,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # GPU 支持（可选）
 option(FUNASR_CUDA "Enable CUDA GPU support" OFF)
 
+# 可选模块
+#   FUNASR_BUILD_AUDIO_CAPTURE: 构建麦克风音频采集模块（依赖 miniaudio）
+#   FUNASR_BUILD_REALTIME:      构建实时识别器（内置 VAD，依赖 realtime.hpp）
+# 关闭后可得到一个不含 VAD / 麦克风输入的精简构建。
+option(FUNASR_BUILD_AUDIO_CAPTURE "Build microphone audio capture module" ON)
+option(FUNASR_BUILD_REALTIME      "Build realtime recognizer with built-in VAD" ON)
+
 if(FUNASR_CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
     add_compile_definitions(FUNASR_USE_CUDA)
+endif()
+
+if(FUNASR_BUILD_AUDIO_CAPTURE)
+    add_compile_definitions(FUNASR_HAS_AUDIO_CAPTURE)
+endif()
+if(FUNASR_BUILD_REALTIME)
+    add_compile_definitions(FUNASR_HAS_REALTIME)
 endif()
 
 # ============================================================
@@ -54,10 +68,12 @@ target_link_libraries(funasr_compute PUBLIC funasr_core)
 # ============================================================
 # funasr_pipeline
 # ============================================================
-add_library(funasr_pipeline STATIC
-    pipeline/pipeline.cpp
-    pipeline/audio_capture.cpp
-)
+set(FUNASR_PIPELINE_SOURCES pipeline/pipeline.cpp)
+if(FUNASR_BUILD_AUDIO_CAPTURE)
+    list(APPEND FUNASR_PIPELINE_SOURCES pipeline/audio_capture.cpp)
+endif()
+
+add_library(funasr_pipeline STATIC ${FUNASR_PIPELINE_SOURCES})
 target_link_libraries(funasr_pipeline PUBLIC funasr_model funasr_compute)
 if(UNIX AND NOT APPLE)
     target_link_libraries(funasr_pipeline PUBLIC pthread dl m)
@@ -90,8 +106,10 @@ target_link_libraries(test_llm PRIVATE funasr_model funasr_compute)
 add_executable(test_pipeline test/test_pipeline.cpp)
 target_link_libraries(test_pipeline PRIVATE funasr_pipeline)
 
-add_executable(test_realtime test/test_realtime.cpp)
-target_link_libraries(test_realtime PRIVATE funasr_pipeline)
+if(FUNASR_BUILD_AUDIO_CAPTURE AND FUNASR_BUILD_REALTIME)
+    add_executable(test_realtime test/test_realtime.cpp)
+    target_link_libraries(test_realtime PRIVATE funasr_pipeline)
+endif()
 
 if(FUNASR_CUDA)
     add_executable(test_gpu test/test_gpu.cpp)

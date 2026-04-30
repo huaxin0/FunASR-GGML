@@ -40,6 +40,23 @@ cmake .. -DFUNASR_CUDA=ON
 make -j$(nproc)
 ```
 
+### Build options
+
+| Option                       | Default | Description                                                       |
+| ---------------------------- | ------- | ----------------------------------------------------------------- |
+| `FUNASR_CUDA`                | `OFF`   | Enable CUDA GPU support (requires CUDA Toolkit).                  |
+| `FUNASR_BUILD_AUDIO_CAPTURE` | `ON`    | Build microphone capture module (depends on `miniaudio`).         |
+| `FUNASR_BUILD_REALTIME`      | `ON`    | Build the real-time recognizer (built-in VAD + streaming).        |
+
+Turn off the last two to get a minimal build with no microphone input and no VAD (file transcription only):
+
+```bash
+cmake .. -DFUNASR_BUILD_AUDIO_CAPTURE=OFF -DFUNASR_BUILD_REALTIME=OFF
+make -j$(nproc)
+```
+
+Note: `test_realtime` is only built when both `FUNASR_BUILD_AUDIO_CAPTURE` and `FUNASR_BUILD_REALTIME` are `ON`.
+
 ### Run
 
 ```bash
