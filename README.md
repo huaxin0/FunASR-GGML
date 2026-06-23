@@ -2,7 +2,12 @@
 
 C++ speech recognition inference engine using [GGML](https://github.com/ggerganov/ggml), powered by FunASR's SenseVoice architecture.
 
-**Audio → Text**, fully local, no Python, no server.
+**Audio → Text**, fully local for core ASR, with optional local web/video tools.
+
+This branch also includes a long-video offline path inspired by vLLM-style
+continuous batching and paged KV cache, plus a Bilibili browser sidebar for
+turning videos into clickable transcripts, summaries, mind maps, key frames, and
+video Q&A.
 
 ## Features
 
@@ -11,7 +16,26 @@ C++ speech recognition inference engine using [GGML](https://github.com/ggergano
 - **CPU + GPU** — LLM decoder runs on CUDA GPU (Encoder/Adaptor stay on CPU)
 - **VAD segmentation** — energy VAD by default, optional Silero VAD model via ggml
 - **Real-time microphone** — VAD-based streaming recognition with [miniaudio](https://github.com/mackron/miniaudio)
+- **Long-video offline batching** — fixed-window or VAD chunks with scheduler batching, paged KV, and graph cache
+- **Video workflow** — URL/local media helpers for Bilibili, YouTube, Douyin, and local files
+- **Bilibili learning sidebar** — Chrome/Edge MV3 extension for transcripts, DeepSeek summaries, mind maps, key frames, and Q&A
+- **C ABI SDK** — `funasr_sdk` wrapper for Qt/Windows integration and hotword injection
 - **~985M parameters** — Audio Encoder (SANM) + Audio Adaptor + LLM Decoder (Qwen3-0.6B)
+
+## What Is In This Snapshot
+
+This repository is no longer only the original single-file demo path. The
+current snapshot contains three working tracks:
+
+1. **Core local ASR**: C++17 GGUF loader, CPU/GPU decoder, realtime microphone,
+   CLI transcription, VAD/window chunking, and a C ABI SDK.
+2. **Offline long-video throughput**: an offline scheduler that batches chunk
+   decode steps, uses paged KV cache for decode requests, keeps a stable decode
+   graph shape, and caches the hottest graph.
+3. **Video learning workflow**: a local FastAPI web service and a no-build
+   Bilibili sidebar extension that can analyze the current video, reuse cached
+   results, generate study notes, render a clickable mind map, extract key
+   frames, and answer questions against the transcript.
 
 ## Architecture
 
@@ -29,7 +53,7 @@ WAV (16kHz)
 ### Build (CPU only)
 
 ```bash
-git clone --recursive https://github.com/huaxin0/funasr_cpp/FunASR-GGML.git
+git clone --recursive https://github.com/huaxin0/FunASR-GGML.git
 cd FunASR-GGML
 mkdir build && cd build
 cmake ..
@@ -371,6 +395,46 @@ Silero VAD options:
 
 The Silero VAD implementation is adapted from [whisper.cpp](https://github.com/ggml-org/whisper.cpp) and runs on CPU. The VAD model file uses whisper.cpp's custom ggml binary format, not GGUF.
 
+## Offline Long-Video Batching
+
+For long recordings, the expensive part is not just one utterance of inference;
+it is keeping many independent chunks moving through the decoder without
+rebuilding and reallocating everything at each decode step. The offline path in
+`pipeline/offline_batching.*` and `test/test_offline_batching.cpp` is the
+throughput-oriented route.
+
+Recommended RTX 4070 Laptop 8GB command used during profiling:
+
+```bash
+./build-cuda/test_offline_batching FunAsr_q8.bin \
+  outputs/video_asr/20260502_130430/media/source_16k.wav \
+  --gpu --kv-mode paged --batch-size 12 --ctx-size 4096 \
+  --kv-block-size 128 --chunk-mode window --chunk-sec 30 \
+  --max-tokens 220
+```
+
+The current fast path combines:
+
+- scheduler batching across independent audio chunks
+- paged KV cache for decode requests
+- token-id paged batch decode, avoiding host embedding fallback
+- dynamic paged KV write so the decode graph does not depend on physical KV rows
+- bucketed decode shapes and graph cache for the hottest batch shape
+
+Representative profiling result on RTX 4070 Laptop GPU + i7-13700H:
+
+| Workload | Config | Wall time | Throughput | Notes |
+| --- | --- | ---: | ---: | --- |
+| ~6119 s audio (~102 min) | paged KV, batch=12, block=128, 30 s chunks | 52-59 s | 100-117 audio-sec/s | End-to-end offline test path |
+| Same workload, graph cache snapshot | paged KV, batch=12 | 52.12 s | 117.42 audio-sec/s | Best recorded local run |
+| Single-request continuous baseline | batch=1 | 308.63 s | 19.8 audio-sec/s | Before scheduler batching |
+
+These numbers are workload and GPU dependent. They are included to show the
+order of magnitude and the benchmark shape, not as a universal guarantee. See
+`docs/superpowers/notes/2026-05-27-vllm-style-offline-asr-retrospective.md` and
+`docs/superpowers/notes/2026-06-11-offline-decode-kernel-profiling.md` for the
+full optimization notes.
+
 ## Video URL Transcription
 
 `tools/funasr_video_ui.py` is a small terminal UI for long-video testing. Paste a Bilibili, YouTube, Douyin, or local media path, and it will:
@@ -429,8 +493,8 @@ WSL, such as `chrome`, `edge`, or `firefox`.
 
 ### Bilibili Browser Sidebar MVP
 
-There is also a first-pass no-build browser extension for validating the
-Bilibili in-page learning flow:
+There is also a no-build browser extension for validating the Bilibili in-page
+learning flow:
 
 ```text
 browser-extension/bilibili-funasr-sidebar
@@ -442,6 +506,13 @@ Start the local service first:
 FUNASR_WEB_APP_PORT=8008 python3 tools/funasr_web_app.py
 ```
 
+For summary, mind map, key-frame explanation, and video Q&A generation, provide
+a DeepSeek API key through the environment or the sidebar:
+
+```bash
+DEEPSEEK_API_KEY=sk-... FUNASR_WEB_APP_PORT=8008 python3 tools/funasr_web_app.py
+```
+
 Then open `chrome://extensions` or `edge://extensions`, enable Developer mode,
 click "Load unpacked", and select `browser-extension/bilibili-funasr-sidebar`.
 
@@ -449,6 +520,22 @@ On a Bilibili video page, the extension injects a right-side FunASR sidebar. It
 sends the current URL to the local service, waits for transcription, renders
 timestamped transcript nodes, and clicking a timestamp jumps the current page's
 `<video>` element to that time.
+
+The sidebar currently supports:
+
+- local service auto-detection on `127.0.0.1:8008`, `:8009`, or `:8010`
+- cached-result lookup by Bilibili video id/page, so previous transcripts can be
+  loaded without re-running ASR
+- grouped subtitle nodes, search, active playback highlight, and clickable
+  timestamp jumps
+- DeepSeek-generated takeaways, timestamped highlights, and Markdown study notes
+- sidebar mind map with collapsible nodes, evidence, questions, and timestamp chips
+- key-frame extraction from saved video media based on summary highlights
+- video Q&A backed by the saved transcript and summary, with persisted chat history
+
+Generated artifacts are kept under `outputs/video_asr_web/`, including
+`transcript.json`, `summary.json`, `summary.md`, `mindmap.json`, extracted
+`frames/`, and `chat_sessions/default.json`.
 
 ## Model
 
@@ -468,10 +555,17 @@ python hf_convert_ggml_q8.py --model-dir <huggingface_model> --output FunAsr_q8.
 
 Tested on RTX 4070 Laptop GPU + i7-13700H:
 
-| Mode | Prefill (116 tok) | Decode Speed | RTF (realtime) |
-| ---- | ----------------- | ------------ | -------------- |
-| CPU  | 1052 ms           | 12.0 tok/s   | 0.91           |
-| GPU  | 23 ms             | 55-62 tok/s  | 0.28-0.35      |
+| Mode | Workload | Result |
+| ---- | -------- | ------ |
+| CPU realtime | Single utterance | Prefill 1052 ms, decode ~12 tok/s, RTF ~0.91 |
+| GPU realtime | Single utterance | Prefill 23 ms, decode 55-62 tok/s, RTF ~0.28-0.35 |
+| GPU offline baseline | ~6119 s audio, batch=1 | 308.63 s wall, ~19.8 audio-sec/s |
+| GPU offline paged batch | ~6119 s audio, batch=12, block=128 | 52-59 s wall, ~100-117 audio-sec/s |
+
+The offline numbers come from the dedicated long-video benchmark path and use
+30-second fixed windows. For comparable results, keep the same chunk shape and
+report `wall`, `rtf`, `audio_sec/s`, `tokens/s`, `batch_size`, `kv_mode`, and
+`kv_block_size`.
 
 ## Project Structure
 
