@@ -19,6 +19,9 @@
 
 namespace funasr {
 
+void set_fsmn_fused_cuda_enabled(bool enabled);
+bool fsmn_fused_cuda_enabled();
+
 // ============================================================
 // FSMN: Feedforward Sequential Memory Networks
 // depthwise conv1d, 手动展开为 K 次 slice-multiply-accumulate

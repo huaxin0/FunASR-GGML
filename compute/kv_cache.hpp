@@ -1,14 +1,14 @@
 // KV Cache — RAII 管理，用于 LLM 自回归解码
 //
-// 内存布局: 一个大的 1D F32 tensor
+// 内存布局: 一个大的 1D F16 tensor
 //   K: [n_layers × n_ctx × kv_dim] (kv_dim = n_kv_heads × head_dim = 1024)
 //   V: 同上
 //
 // 工作流:
 //   1. init() 分配内存
-//   2. forward 时 set_pending() 记录当前步计算出的 K/V tensor 指针
-//   3. run_graph() 执行计算图
-//   4. commit() 把 pending 数据 memcpy 到 cache (必须在 ggml_free 之前!)
+//   2. forward 时创建当前 K/V 到 cache slot 的 ggml_cpy 节点
+//   3. 调用方把 cpy 节点加入 graph，再加入 logits 节点
+//   4. run_graph() 执行计算图，K/V 在图内写入 cache
 //   5. 下一步 forward 时从 cache 读取历史 K/V
 //
 #ifndef FUNASR_COMPUTE_KV_CACHE_HPP
@@ -41,13 +41,10 @@ public:
         n_layers_ = cfg.block_count;
         kv_dim_   = cfg.kv_dim();  // n_kv_heads * head_dim = 1024
 
-        // 清空 pending
-        pending_.resize(n_layers_);
-        for (auto& p : pending_) { p.k = nullptr; p.v = nullptr; }
-
         // 分配内存
+        const ggml_type kv_type = GGML_TYPE_F16;
         size_t n_elements = static_cast<size_t>(kv_dim_) * n_ctx_ * n_layers_;
-        size_t tensor_size = n_elements * sizeof(float);
+        size_t tensor_size = ggml_row_size(kv_type, kv_dim_) * n_ctx_ * n_layers_;
         size_t mem_size = 2 * tensor_size + 2 * ggml_tensor_overhead() + 4096;
 
         buf_.resize(mem_size);
@@ -64,49 +61,17 @@ public:
             return false;
         }
 
-        k_ = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, n_elements);
-        v_ = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, n_elements);
+        k_ = ggml_new_tensor_1d(ctx_, kv_type, n_elements);
+        v_ = ggml_new_tensor_1d(ctx_, kv_type, n_elements);
 
         memset(k_->data, 0, ggml_nbytes(k_));
         memset(v_->data, 0, ggml_nbytes(v_));
 
         initialized_ = true;
+        printf("[KVCache] CPU KV Cache: K=%.1f MB, V=%.1f MB (%s)\n",
+               ggml_nbytes(k_) / 1e6, ggml_nbytes(v_) / 1e6,
+               ggml_type_name(k_->type));
         return true;
-    }
-
-    // ============================================================
-    // 记录当前步的 K/V (forward 时调用)
-    // 这些指针指向计算图中的 tensor，必须在 graph compute 后、
-    // ggml_free(ctx_compute) 前调用 commit()
-    // ============================================================
-    void set_pending(int layer_idx, ggml_tensor* k, ggml_tensor* v) {
-        if (layer_idx >= 0 && layer_idx < n_layers_) {
-            pending_[layer_idx].k = k;
-            pending_[layer_idx].v = v;
-        }
-    }
-
-    // ============================================================
-    // 提交: 把 pending K/V memcpy 到 cache
-    // 必须在 ggml_graph_compute 之后、ggml_free(ctx_compute) 之前调用
-    // ============================================================
-    void commit(int n_past, int seq_len) {
-        for (int i = 0; i < n_layers_; i++) {
-            if (pending_[i].k && pending_[i].v) {
-                size_t layer_offset = static_cast<size_t>(i) * n_ctx_ * kv_dim_;
-                size_t pos_offset   = static_cast<size_t>(n_past) * kv_dim_;
-                size_t copy_size    = static_cast<size_t>(seq_len) * kv_dim_ * sizeof(float);
-
-                float* dst_k = (float*)k_->data + layer_offset + pos_offset;
-                float* dst_v = (float*)v_->data + layer_offset + pos_offset;
-
-                memcpy(dst_k, pending_[i].k->data, copy_size);
-                memcpy(dst_v, pending_[i].v->data, copy_size);
-
-                pending_[i].k = nullptr;
-                pending_[i].v = nullptr;
-            }
-        }
     }
 
     // ============================================================
@@ -116,7 +81,6 @@ public:
         n_past_ = 0;
         if (k_ && k_->data) memset(k_->data, 0, ggml_nbytes(k_));
         if (v_ && v_->data) memset(v_->data, 0, ggml_nbytes(v_));
-        for (auto& p : pending_) { p.k = nullptr; p.v = nullptr; }
     }
 
     // ============================================================
@@ -130,7 +94,6 @@ public:
         k_ = nullptr;
         v_ = nullptr;
         buf_.clear();
-        pending_.clear();
         initialized_ = false;
         n_past_ = 0;
     }
@@ -160,9 +123,6 @@ private:
     int n_past_   = 0;
     int n_layers_ = 0;
     int kv_dim_   = 0;
-
-    struct Pending { ggml_tensor* k; ggml_tensor* v; };
-    std::vector<Pending> pending_;
 
     bool initialized_ = false;
 };

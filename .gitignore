@@ -1,10 +1,45 @@
 # Build
 build/
+build-*/
 cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
 
 # Model files (too large for git)
 *.bin
 *.gguf
+
+# Local run outputs and media
+outputs/
+cookies.txt
+hotwords.txt
+*.docx*
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+*.wav
+*.mp3
+*.m4a
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.flv
+*.avi
+*.srt
+*.tsv
+*.Zone.Identifier
+*:Zone.Identifier
+
+# Local tooling state
+.codegraph/
+.agents/
+.codex
+.superpowers/
+__pycache__/
+*.py[cod]
 
 # IDE
 .vscode/
@@ -22,9 +57,7 @@ Thumbs.db
 *.o
 *.a
 *.so
-*.dylib*.wav 
-*.wav 
-FunAsr_q8.zip 
-__pycache__/ 
-*.pyc 
-build/ 
+*.dylib
+*.dll
+*.lib
+*.exe

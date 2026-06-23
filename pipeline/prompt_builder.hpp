@@ -20,18 +20,23 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <sstream>
 
 namespace funasr {
+
+struct PromptOptions {
+    std::vector<std::string> hotwords;
+    std::string language;
+    bool itn = true;
+};
 
 class PromptBuilder {
 public:
     explicit PromptBuilder(const Tokenizer& tokenizer)
         : tokenizer_(tokenizer)
     {
-        // 编码固定的 prefix 和 suffix
-        std::string prefix_text =
-            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-            "<|im_start|>user\n语音转写：";
+        // 编码默认 prefix 和 suffix
+        std::string prefix_text = build_prefix_text(PromptOptions{});
         std::string suffix_text =
             "<|im_end|>\n<|im_start|>assistant\n";
 
@@ -56,13 +61,16 @@ public:
         int audio_frames,
         ggml_tensor* embed_tokens,
         int embed_dim,
-        float* out_embeds
+        float* out_embeds,
+        const PromptOptions& options = PromptOptions{}
     ) const {
-        int total = total_len(audio_frames);
+        std::vector<int> prefix_ids = this->prefix_ids(options);
+        std::vector<int> suffix_ids = this->suffix_ids();
+        int total = total_len(audio_frames, options);
         int pos = 0;
 
         // prefix token embeddings
-        for (int id : prefix_ids_) {
+        for (int id : prefix_ids) {
             get_token_embedding(embed_tokens, id, out_embeds + pos * embed_dim, embed_dim);
             pos++;
         }
@@ -74,7 +82,7 @@ public:
         pos += audio_frames;
 
         // suffix token embeddings
-        for (int id : suffix_ids_) {
+        for (int id : suffix_ids) {
             get_token_embedding(embed_tokens, id, out_embeds + pos * embed_dim, embed_dim);
             pos++;
         }
@@ -86,8 +94,54 @@ public:
     int prefix_len()                   const { return static_cast<int>(prefix_ids_.size()); }
     int suffix_len()                   const { return static_cast<int>(suffix_ids_.size()); }
     int total_len(int audio_frames)    const { return prefix_len() + audio_frames + suffix_len(); }
+    int prefix_len(const PromptOptions& options) const {
+        return static_cast<int>(prefix_ids(options).size());
+    }
+    int total_len(int audio_frames, const PromptOptions& options) const {
+        return prefix_len(options) + audio_frames + suffix_len();
+    }
     const std::vector<int>& prefix_ids() const { return prefix_ids_; }
     const std::vector<int>& suffix_ids() const { return suffix_ids_; }
+    std::vector<int> prefix_ids(const PromptOptions& options) const {
+        if (options.hotwords.empty() && options.language.empty() && options.itn) {
+            return prefix_ids_;
+        }
+        return tokenizer_.encode(build_prefix_text(options));
+    }
+    std::vector<int> suffix_ids(const PromptOptions&) const { return suffix_ids_; }
+
+    static std::string build_user_prompt(const PromptOptions& options) {
+        return build_user_prompt(options.hotwords, options.language, options.itn);
+    }
+
+    static std::string build_user_prompt(
+        const std::vector<std::string>& hotwords,
+        const std::string& language,
+        bool itn
+    ) {
+        std::string prompt;
+        if (!hotwords.empty()) {
+            prompt =
+                "请结合上下文信息，更加准确地完成语音转写任务。如果没有相关信息，我们会留空。\n\n\n"
+                "**上下文信息：**\n\n\n";
+            prompt += "热词列表：[";
+            for (size_t i = 0; i < hotwords.size(); i++) {
+                if (i > 0) prompt += ", ";
+                prompt += hotwords[i];
+            }
+            prompt += "]\n";
+        }
+        if (language.empty()) {
+            prompt += "语音转写";
+        } else {
+            prompt += "语音转写成" + language;
+        }
+        if (!itn) {
+            prompt += "，不进行文本规整";
+        }
+        prompt += "：";
+        return prompt;
+    }
 
     // 从 embed_tokens 获取单个 token embedding
     static void get_token_embedding(
@@ -113,6 +167,12 @@ public:
     }
 
 private:
+    static std::string build_prefix_text(const PromptOptions& options) {
+        return "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+               "<|im_start|>user\n" +
+               build_user_prompt(options);
+    }
+
     const Tokenizer& tokenizer_;
     std::vector<int> prefix_ids_;
     std::vector<int> suffix_ids_;

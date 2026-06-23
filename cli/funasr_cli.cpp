@@ -4,11 +4,14 @@
 //   funasr-cli -m <model> -f <input> [options]
 //
 #include "pipeline/recognizer.hpp"
+#include "pipeline/chunking.hpp"
+#include "pipeline/offline_batching.hpp"
 #include "compute/silero_vad.hpp"
 #include "miniaudio.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +26,7 @@
 #include <vector>
 
 #ifndef _WIN32
+#include <cstdlib>
 #include <unistd.h>
 #endif
 
@@ -36,6 +40,17 @@ enum class OutputFormat {
     Tsv,
 };
 
+enum class ChunkMode {
+    None,
+    Window,
+    Vad,
+};
+
+enum class OfflineKVMode {
+    Continuous,
+    Paged,
+};
+
 struct Options {
     std::string model_path;
     std::string input_path;
@@ -47,10 +62,14 @@ struct Options {
 
     bool use_gpu = false;
     int gpu_id = 0;
+    int ctx_size = 2048;
     int n_threads = 4;
     int max_tokens = 100;
 
     bool use_vad = false;
+    bool chunk_mode_set = false;
+    ChunkMode chunk_mode = ChunkMode::None;
+    int chunk_sec = 30;
     std::string vad_model_path;
     int max_segment_sec = 5;
     bool max_segment_sec_set = false;
@@ -58,6 +77,14 @@ struct Options {
     int segment_pad_ms = 200;
     float energy_threshold = 0.002f;
     funasr::SileroVadParams silero_vad;
+
+    bool offline_scheduler = false;
+    bool offline_profile = false;
+    bool offline_paged_opts = true;
+    int offline_batch_size = 12;
+    OfflineKVMode offline_kv_mode = OfflineKVMode::Continuous;
+    int offline_kv_block_size = 64;
+    int offline_kv_num_blocks = 0;
 
     bool help = false;
 };
@@ -77,15 +104,6 @@ struct TranscriptionItem {
     float inference_ms = 0.0f;
     std::vector<SegmentResult> segments;
     bool ok = false;
-};
-
-struct AudioSegment {
-    size_t start_sample = 0;
-    size_t end_sample = 0;
-    size_t infer_start_sample = 0;
-    size_t infer_end_sample = 0;
-    float start_sec = 0.0f;
-    float end_sec = 0.0f;
 };
 
 class ScopedStdoutToStderr {
@@ -140,9 +158,12 @@ void print_usage(const char* argv0) {
         "GPU:\n"
         "  --gpu                  Enable GPU inference\n"
         "  --gpu-id <id>          CUDA device ID (default: 0)\n"
+        "  --ctx-size <n>         LLM KV cache context size (default: 2048)\n"
         "\n"
         "Long audio:\n"
-        "  --vad                  Enable energy VAD segmentation\n"
+        "  --chunk-mode <mode>    Chunking mode: none, window, vad (default: none)\n"
+        "  --chunk-sec <n>        Fixed window size in seconds for --chunk-mode window (default: 30)\n"
+        "  --vad                  Shortcut for --chunk-mode vad\n"
         "  --vad-model <path>     Use Silero VAD model file for segmentation\n"
         "  --vad-threshold <f>    Silero speech probability threshold (default: 0.5)\n"
         "  --vad-min-speech-ms <n> Silero minimum speech duration (default: 250)\n"
@@ -153,6 +174,16 @@ void print_usage(const char* argv0) {
         "  --min-silence-ms <n>   Minimum silence for splitting (default: 600)\n"
         "  --segment-pad-ms <n>   Audio padding around VAD segments (default: 200)\n"
         "  --energy-threshold <f> RMS speech threshold (default: 0.002)\n"
+        "\n"
+        "Offline scheduler:\n"
+        "  --offline-scheduler    Use continuous offline scheduler for chunked audio\n"
+        "  --offline-profile      Print scheduler and paged decode profile lines\n"
+        "  --offline-preset <n>   Preset: long-video\n"
+        "  --no-offline-paged-opts Disable default paged decode optimization env flags\n"
+        "  --batch-size <n>       Offline scheduler active request limit (default: 12)\n"
+        "  --kv-mode <mode>       Offline KV mode: continuous, paged (default: continuous)\n"
+        "  --kv-block-size <n>    Paged KV block size (default: 64)\n"
+        "  --kv-num-blocks <n>    Paged KV block count (default: derived)\n"
         "\n"
         "Other:\n"
         "  -t, --threads <n>      CPU threads (default: 4)\n"
@@ -239,6 +270,116 @@ bool parse_positive_float(const std::string& value, float& out) {
     return true;
 }
 
+bool parse_chunk_mode(const std::string& value, ChunkMode& out) {
+    std::string mode = to_lower(value);
+    if (mode == "none") {
+        out = ChunkMode::None;
+        return true;
+    }
+    if (mode == "window") {
+        out = ChunkMode::Window;
+        return true;
+    }
+    if (mode == "vad") {
+        out = ChunkMode::Vad;
+        return true;
+    }
+    return false;
+}
+
+bool parse_offline_kv_mode(const std::string& value, OfflineKVMode& out) {
+    std::string mode = to_lower(value);
+    if (mode == "continuous") {
+        out = OfflineKVMode::Continuous;
+        return true;
+    }
+    if (mode == "paged") {
+        out = OfflineKVMode::Paged;
+        return true;
+    }
+    return false;
+}
+
+bool apply_offline_preset(const std::string& value, Options& opt) {
+    std::string preset = to_lower(value);
+    if (preset != "long-video") {
+        return false;
+    }
+
+    opt.offline_scheduler = true;
+    opt.offline_profile = true;
+    opt.offline_batch_size = 12;
+    opt.offline_kv_mode = OfflineKVMode::Paged;
+    opt.offline_kv_block_size = 128;
+    opt.ctx_size = 4096;
+    opt.chunk_mode = ChunkMode::Window;
+    opt.chunk_mode_set = true;
+    opt.chunk_sec = 30;
+    opt.max_tokens = 220;
+    return true;
+}
+
+const char* chunk_mode_name(ChunkMode mode) {
+    switch (mode) {
+        case ChunkMode::Window: return "window";
+        case ChunkMode::Vad:    return "vad";
+        case ChunkMode::None:
+        default:                return "none";
+    }
+}
+
+const char* offline_kv_mode_name(OfflineKVMode mode) {
+    switch (mode) {
+        case OfflineKVMode::Paged:      return "paged";
+        case OfflineKVMode::Continuous:
+        default:                        return "continuous";
+    }
+}
+
+bool should_use_offline_scheduler(const Options& opt, bool loaded, size_t chunk_count) {
+    return opt.offline_scheduler && opt.chunk_mode != ChunkMode::None && loaded && chunk_count > 0;
+}
+
+bool should_enable_offline_paged_opts(const Options& opt) {
+    return opt.offline_paged_opts &&
+           opt.use_gpu &&
+           opt.offline_scheduler &&
+           opt.chunk_mode != ChunkMode::None &&
+           opt.offline_kv_mode == OfflineKVMode::Paged;
+}
+
+int gpu_init_slots(const Options& opt) {
+    if (opt.offline_scheduler && opt.chunk_mode != ChunkMode::None) {
+        return std::max(1, opt.offline_batch_size);
+    }
+    return 1;
+}
+
+funasr::OfflineBatchConfig make_offline_batch_config(const Options& opt) {
+    funasr::OfflineBatchConfig cfg;
+    cfg.batch_size = opt.offline_batch_size;
+    cfg.ctx_size = opt.ctx_size;
+    cfg.max_tokens = opt.max_tokens;
+    cfg.n_threads = opt.n_threads;
+    cfg.use_gpu = opt.use_gpu;
+    cfg.gpu_id = opt.gpu_id;
+    cfg.use_paged_kv = opt.offline_kv_mode == OfflineKVMode::Paged;
+    cfg.kv_block_size = opt.offline_kv_block_size;
+    cfg.kv_num_blocks = opt.offline_kv_num_blocks;
+    return cfg;
+}
+
+void apply_offline_paged_env_defaults(const Options& opt) {
+    if (!should_enable_offline_paged_opts(opt)) {
+        return;
+    }
+#ifndef _WIN32
+    setenv("FUNASR_PAGED_KV_WRITE_OP", "1", 0);
+    setenv("FUNASR_PAGED_DECODE_BUCKET_MAX_KV", "1", 0);
+    setenv("FUNASR_PAGED_DECODE_GRAPH_CACHE", "1", 0);
+#endif
+}
+
 bool parse_args(int argc, char* argv[], Options& opt) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -293,6 +434,12 @@ bool parse_args(int argc, char* argv[], Options& opt) {
                 std::fprintf(stderr, "Invalid --gpu-id value\n");
                 return false;
             }
+        } else if (arg == "--ctx-size") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_positive_int(value, opt.ctx_size)) {
+                std::fprintf(stderr, "Invalid --ctx-size value\n");
+                return false;
+            }
         } else if (arg == "-t" || arg == "--threads") {
             const char* value = need_value(arg.c_str());
             if (!value || !parse_positive_int(value, opt.n_threads)) {
@@ -303,6 +450,19 @@ bool parse_args(int argc, char* argv[], Options& opt) {
             const char* value = need_value(arg.c_str());
             if (!value || !parse_positive_int(value, opt.max_tokens)) {
                 std::fprintf(stderr, "Invalid --max-tokens value\n");
+                return false;
+            }
+        } else if (arg == "--chunk-mode") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_chunk_mode(value, opt.chunk_mode)) {
+                std::fprintf(stderr, "Invalid --chunk-mode value: use none, window, or vad\n");
+                return false;
+            }
+            opt.chunk_mode_set = true;
+        } else if (arg == "--chunk-sec") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_positive_int(value, opt.chunk_sec)) {
+                std::fprintf(stderr, "Invalid --chunk-sec value\n");
                 return false;
             }
         } else if (arg == "--vad") {
@@ -366,6 +526,42 @@ bool parse_args(int argc, char* argv[], Options& opt) {
                 std::fprintf(stderr, "Invalid --energy-threshold value\n");
                 return false;
             }
+        } else if (arg == "--offline-scheduler") {
+            opt.offline_scheduler = true;
+        } else if (arg == "--offline-profile") {
+            opt.offline_profile = true;
+        } else if (arg == "--no-offline-paged-opts") {
+            opt.offline_paged_opts = false;
+        } else if (arg == "--offline-preset") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !apply_offline_preset(value, opt)) {
+                std::fprintf(stderr, "Invalid --offline-preset value: use long-video\n");
+                return false;
+            }
+        } else if (arg == "--batch-size") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_positive_int(value, opt.offline_batch_size)) {
+                std::fprintf(stderr, "Invalid --batch-size value\n");
+                return false;
+            }
+        } else if (arg == "--kv-mode") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_offline_kv_mode(value, opt.offline_kv_mode)) {
+                std::fprintf(stderr, "Invalid --kv-mode value: use continuous or paged\n");
+                return false;
+            }
+        } else if (arg == "--kv-block-size") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_positive_int(value, opt.offline_kv_block_size)) {
+                std::fprintf(stderr, "Invalid --kv-block-size value\n");
+                return false;
+            }
+        } else if (arg == "--kv-num-blocks") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_nonnegative_int(value, opt.offline_kv_num_blocks)) {
+                std::fprintf(stderr, "Invalid --kv-num-blocks value\n");
+                return false;
+            }
         } else {
             std::fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
             return false;
@@ -376,6 +572,12 @@ bool parse_args(int argc, char* argv[], Options& opt) {
         std::fprintf(stderr, "Missing required -m/--model or -f/--file\n");
         return false;
     }
+    if (!opt.chunk_mode_set) {
+        if (opt.use_vad || !opt.vad_model_path.empty()) {
+            opt.chunk_mode = ChunkMode::Vad;
+        }
+    }
+    opt.use_vad = opt.chunk_mode == ChunkMode::Vad;
     return true;
 }
 
@@ -488,178 +690,6 @@ bool load_audio_file(const std::string& path, std::vector<float>& samples, uint3
     return !samples.empty();
 }
 
-void add_audio_segment(std::vector<AudioSegment>& segments,
-                       size_t start_sample, size_t end_sample,
-                       size_t infer_start_sample, size_t infer_end_sample,
-                       size_t total_samples, int sample_rate) {
-    constexpr int min_segment_ms = 500;
-    start_sample = std::min(start_sample, total_samples);
-    end_sample = std::min(end_sample, total_samples);
-    infer_start_sample = std::min(infer_start_sample, total_samples);
-    infer_end_sample = std::min(infer_end_sample, total_samples);
-    size_t min_samples = static_cast<size_t>(sample_rate) * min_segment_ms / 1000;
-    if (end_sample <= start_sample || end_sample - start_sample < min_samples) {
-        return;
-    }
-    if (infer_end_sample <= infer_start_sample) {
-        infer_start_sample = start_sample;
-        infer_end_sample = end_sample;
-    }
-    AudioSegment seg;
-    seg.start_sample = start_sample;
-    seg.end_sample = end_sample;
-    seg.infer_start_sample = infer_start_sample;
-    seg.infer_end_sample = infer_end_sample;
-    seg.start_sec = static_cast<float>(start_sample) / sample_rate;
-    seg.end_sec = static_cast<float>(end_sample) / sample_rate;
-    segments.push_back(seg);
-}
-
-std::vector<AudioSegment> split_audio_by_vad(const std::vector<float>& samples,
-                                             int sample_rate,
-                                             int max_segment_sec,
-                                             int min_silence_ms,
-                                             int segment_pad_ms,
-                                             float threshold) {
-    std::vector<AudioSegment> segments;
-    if (samples.empty()) {
-        return segments;
-    }
-
-    constexpr int frame_ms = 10;
-    constexpr int min_segment_ms = 500;
-    int frame_samples = sample_rate * frame_ms / 1000;
-    int pad_frames = std::max(0, segment_pad_ms) / frame_ms;
-    int min_silence_frames = std::max(1, min_silence_ms / frame_ms);
-    int max_segment_frames = std::max(1, max_segment_sec * 1000 / frame_ms);
-    int min_segment_frames = std::max(1, min_segment_ms / frame_ms);
-
-    int n_frames = static_cast<int>((samples.size() + frame_samples - 1) / frame_samples);
-    std::vector<float> rms(static_cast<size_t>(n_frames), 0.0f);
-    for (int i = 0; i < n_frames; i++) {
-        size_t start = static_cast<size_t>(i) * frame_samples;
-        size_t end = std::min(samples.size(), start + frame_samples);
-        double sum = 0.0;
-        for (size_t j = start; j < end; j++) {
-            sum += static_cast<double>(samples[j]) * samples[j];
-        }
-        if (end > start) {
-            rms[static_cast<size_t>(i)] = static_cast<float>(
-                std::sqrt(sum / static_cast<double>(end - start)));
-        }
-    }
-
-    bool in_segment = false;
-    int seg_start_frame = 0;
-    int last_speech_frame = 0;
-    int silence_frames = 0;
-
-    auto frame_to_sample = [&](int frame) -> size_t {
-        return std::min(samples.size(), static_cast<size_t>(std::max(0, frame)) * frame_samples);
-    };
-
-    auto finish_segment = [&](int end_frame) {
-        if (end_frame - seg_start_frame + 1 < min_segment_frames) {
-            return;
-        }
-        int core_start = seg_start_frame;
-        int core_end = std::min(n_frames, end_frame + 1);
-        int infer_start = std::max(0, core_start - pad_frames);
-        int infer_end = std::min(n_frames, core_end + pad_frames);
-        add_audio_segment(segments,
-                          frame_to_sample(core_start),
-                          frame_to_sample(core_end),
-                          frame_to_sample(infer_start),
-                          frame_to_sample(infer_end),
-                          samples.size(), sample_rate);
-    };
-
-    for (int i = 0; i < n_frames; i++) {
-        bool speech = rms[static_cast<size_t>(i)] > threshold;
-        if (speech) {
-            if (!in_segment) {
-                in_segment = true;
-                seg_start_frame = i;
-                silence_frames = 0;
-            }
-            last_speech_frame = i;
-            silence_frames = 0;
-        } else if (in_segment) {
-            silence_frames++;
-        }
-
-        if (in_segment && i - seg_start_frame + 1 >= max_segment_frames) {
-            int search_begin = std::min(i, seg_start_frame + min_segment_frames);
-            int split_frame = search_begin;
-            float min_rms = rms[static_cast<size_t>(split_frame)];
-            for (int j = search_begin; j <= i; j++) {
-                if (rms[static_cast<size_t>(j)] < min_rms) {
-                    min_rms = rms[static_cast<size_t>(j)];
-                    split_frame = j;
-                }
-            }
-            finish_segment(split_frame);
-            in_segment = true;
-            seg_start_frame = std::min(i, split_frame + 1);
-            last_speech_frame = i;
-            silence_frames = speech ? 0 : 1;
-        } else if (in_segment && silence_frames >= min_silence_frames) {
-            finish_segment(last_speech_frame);
-            in_segment = false;
-            silence_frames = 0;
-        }
-    }
-
-    if (in_segment) {
-        finish_segment(last_speech_frame);
-    }
-
-    if (segments.empty()) {
-        add_audio_segment(segments, 0, samples.size(), 0, samples.size(),
-                          samples.size(), sample_rate);
-    }
-    return segments;
-}
-
-std::vector<AudioSegment> convert_silero_segments(
-    const std::vector<funasr::VadSegment>& vad_segments,
-    size_t total_samples,
-    int sample_rate,
-    float samples_overlap
-) {
-    std::vector<AudioSegment> segments;
-    segments.reserve(vad_segments.size());
-    size_t overlap_samples = static_cast<size_t>(
-        std::max(0.0f, samples_overlap) * sample_rate + 0.5f);
-    for (size_t i = 0; i < vad_segments.size(); i++) {
-        const auto& vad_segment = vad_segments[i];
-        float start_sec = std::max(0.0f, vad_segment.start_sec);
-        float end_sec = std::max(start_sec, vad_segment.end_sec);
-
-        size_t start_sample = std::min(
-            total_samples,
-            static_cast<size_t>(start_sec * sample_rate + 0.5f));
-        size_t end_sample = std::min(
-            total_samples,
-            static_cast<size_t>(end_sec * sample_rate + 0.5f));
-        if (end_sample <= start_sample) {
-            continue;
-        }
-
-        AudioSegment segment;
-        segment.start_sample = start_sample;
-        segment.end_sample = end_sample;
-        segment.infer_start_sample = start_sample;
-        segment.infer_end_sample = i + 1 < vad_segments.size()
-            ? std::min(total_samples, end_sample + overlap_samples)
-            : end_sample;
-        segment.start_sec = static_cast<float>(start_sample) / sample_rate;
-        segment.end_sec = static_cast<float>(end_sample) / sample_rate;
-        segments.push_back(segment);
-    }
-    return segments;
-}
-
 std::string format_timestamp(float seconds) {
     if (seconds < 0.0f) seconds = 0.0f;
 
@@ -693,6 +723,18 @@ std::string append_without_overlap(const std::string& base, const std::string& n
     return base + next;
 }
 
+std::string trim_ascii_space(const std::string& s) {
+    size_t begin = 0;
+    while (begin < s.size() && std::isspace(static_cast<unsigned char>(s[begin]))) {
+        begin++;
+    }
+    size_t end = s.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(s[end - 1]))) {
+        end--;
+    }
+    return s.substr(begin, end - begin);
+}
+
 std::vector<std::string> utf8_chars(const std::string& s) {
     std::vector<std::string> chars;
     for (size_t i = 0; i < s.size();) {
@@ -722,6 +764,112 @@ int utf8_char_count(const std::string& s) {
 
 bool is_one_of(const std::string& ch, const std::vector<std::string>& values) {
     return std::find(values.begin(), values.end(), ch) != values.end();
+}
+
+std::string normalize_for_repeat_compare(const std::string& text) {
+    const std::vector<std::string> ignored = {
+        " ", "\t", "\n", "\r", "，", "。", "！", "？", "；", "：", "、",
+        ",", ".", "!", "?", ";", ":"
+    };
+
+    std::string normalized;
+    for (const auto& ch : utf8_chars(text)) {
+        if (!is_one_of(ch, ignored)) {
+            normalized += ch;
+        }
+    }
+    return normalized;
+}
+
+bool chars_equal_range(const std::vector<std::string>& chars,
+                       size_t a, size_t b, size_t len) {
+    if (a + len > chars.size() || b + len > chars.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (chars[a + i] != chars[b + i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string collapse_repeated_char_runs(const std::string& text) {
+    auto chars = utf8_chars(text);
+    if (chars.size() < 12) {
+        return text;
+    }
+
+    std::string out;
+    for (size_t i = 0; i < chars.size();) {
+        bool collapsed = false;
+        size_t max_unit = std::min<size_t>(32, (chars.size() - i) / 3);
+        for (size_t unit = 4; unit <= max_unit; unit++) {
+            size_t repeats = 1;
+            while (i + (repeats + 1) * unit <= chars.size() &&
+                   chars_equal_range(chars, i, i + repeats * unit, unit)) {
+                repeats++;
+            }
+            if (repeats >= 3) {
+                for (size_t k = 0; k < unit; k++) {
+                    out += chars[i + k];
+                }
+                i += repeats * unit;
+                collapsed = true;
+                break;
+            }
+        }
+        if (!collapsed) {
+            out += chars[i++];
+        }
+    }
+    return out;
+}
+
+std::string collapse_adjacent_repeated_clauses(const std::string& text) {
+    const std::vector<std::string> delimiters = {
+        "。", "！", "？", "；", "，", "、", "：",
+        ".", "!", "?", ";", ",", ":"
+    };
+
+    std::vector<std::string> clauses;
+    std::string current;
+    for (const auto& ch : utf8_chars(text)) {
+        current += ch;
+        if (is_one_of(ch, delimiters)) {
+            clauses.push_back(current);
+            current.clear();
+        }
+    }
+    if (!current.empty()) {
+        clauses.push_back(current);
+    }
+
+    if (clauses.size() < 2) {
+        return text;
+    }
+
+    std::string out;
+    std::string prev_norm;
+    int dropped = 0;
+    for (const auto& clause : clauses) {
+        std::string norm = normalize_for_repeat_compare(clause);
+        if (!norm.empty() && norm == prev_norm && utf8_char_count(norm) >= 4) {
+            dropped++;
+            continue;
+        }
+        out += clause;
+        prev_norm = norm;
+    }
+
+    return dropped > 0 ? out : text;
+}
+
+std::string cleanup_repeated_text(const std::string& text) {
+    std::string cleaned = collapse_adjacent_repeated_clauses(text);
+    cleaned = collapse_repeated_char_runs(cleaned);
+    cleaned = collapse_adjacent_repeated_clauses(cleaned);
+    return trim_ascii_space(cleaned);
 }
 
 std::vector<std::string> split_by_punctuation(
@@ -881,7 +1029,7 @@ void print_batch_progress(int current, int total, int success, int failed, float
     std::fflush(stderr);
 }
 
-void print_vad_progress(int current, int total, const AudioSegment& segment, float audio_sec) {
+void print_vad_progress(int current, int total, const funasr::AudioChunk& segment, float audio_sec) {
     float done = audio_sec > 0.0f ? segment.end_sec * 100.0f / audio_sec : 100.0f;
     if (done > 100.0f) done = 100.0f;
     std::fprintf(stderr, "\r[段 %d/%d] %s - %s | 已完成 %.1f%%",
@@ -910,6 +1058,100 @@ void print_summary(int total, int success, int failed, float total_sec, float to
     std::fprintf(stderr, "========================================\n");
 }
 
+void print_offline_profile(const funasr::OfflineBatchStats& stats,
+                           const funasr::Recognizer& recognizer,
+                           const Options& opt) {
+    std::fprintf(stderr,
+                 "[OfflineCLI] offline_stats: chunks=%d batch=%d kv=%s "
+                 "block_size=%d blocks_peak=%d/%d decode_steps=%d "
+                 "grouped_calls=%d fallback_calls=%d avg_active=%.2f\n",
+                 stats.total_chunks,
+                 stats.batch_size,
+                 stats.use_paged_kv ? "paged" : "continuous",
+                 stats.kv_block_size,
+                 stats.peak_blocks_in_use,
+                 stats.kv_block_capacity,
+                 stats.decode_steps,
+                 stats.decode_group_calls,
+                 stats.decode_fallback_calls,
+                 stats.average_active_batch());
+
+    std::fprintf(stderr,
+                 "[OfflineCLI] fallback_reasons: single=%d token_id=%d "
+                 "host_embed=%d serial_env=%d invalid=%d\n",
+                 stats.fallback_reasons.single_request,
+                 stats.fallback_reasons.token_id_fast_path_unavailable,
+                 stats.fallback_reasons.host_embedding_batch_unavailable,
+                 stats.fallback_reasons.serial_env_forced,
+                 stats.fallback_reasons.invalid_paged_input);
+
+    std::fprintf(stderr,
+                 "[OfflineCLI] scheduler_profile: admit=%d/%d no_kv=%d "
+                 "admit_rounds=%d avg_admit_round=%.2f max_admit_round=%d "
+                 "avg_prefill_wall=%.3fms avg_decode_dispatch=%.3fms idle_steps=%d\n",
+                 stats.admit_success,
+                 stats.admit_attempts,
+                 stats.admit_no_kv_capacity,
+                 stats.admit_rounds,
+                 stats.average_admit_round_size(),
+                 stats.max_admit_round_size,
+                 stats.average_prefill_wall_ms(),
+                 stats.average_decode_dispatch_ms(),
+                 stats.scheduler_idle_steps);
+
+    if (!(opt.use_gpu && stats.use_paged_kv)) {
+        return;
+    }
+
+    const funasr::PagedDecodeProfile profile = recognizer.gpu_paged_decode_profile();
+    if (profile.calls <= 0) {
+        return;
+    }
+
+    const double calls = static_cast<double>(profile.calls);
+    std::fprintf(stderr,
+                 "[OfflineCLI] paged_profile: calls=%ld build=%.3fms "
+                 "alloc=%.3fms set=%.3fms compute=%.3fms get=%.3fms total=%.3fms\n",
+                 profile.calls,
+                 profile.build_ms / calls,
+                 profile.alloc_ms / calls,
+                 profile.set_input_ms / calls,
+                 profile.compute_ms / calls,
+                 profile.get_ms / calls,
+                 profile.avg_total_ms());
+
+    if (profile.paged_attn_calls > 0) {
+        std::fprintf(stderr,
+                     "[OfflineCLI] paged_attn_profile: calls=%ld total=%.3fms "
+                     "avg_kernel=%.6fms graph_compute_share=%.2f%%\n",
+                     profile.paged_attn_calls,
+                     profile.paged_attn_ms,
+                     profile.avg_paged_attn_ms(),
+                     profile.compute_ms > 0.0
+                        ? 100.0 * profile.paged_attn_ms / profile.compute_ms
+                        : 0.0);
+    }
+
+    if (profile.graph_cache_probe_calls > 0) {
+        std::fprintf(stderr,
+                     "[OfflineCLI] paged_graph_cache_probe: calls=%ld "
+                     "shape_hits=%ld shape_hit_rate=%.2f%% "
+                     "param_hits=%ld param_hit_rate=%.2f%% "
+                     "full_hits=%ld full_hit_rate=%.2f%% "
+                     "cache_hits=%ld cache_misses=%ld cache_hit_rate=%.2f%%\n",
+                     profile.graph_cache_probe_calls,
+                     profile.shape_cache_probe_hits,
+                     profile.shape_cache_probe_hit_rate(),
+                     profile.param_cache_probe_hits,
+                     profile.param_cache_probe_hit_rate(),
+                     profile.full_graph_cache_probe_hits,
+                     profile.full_graph_cache_probe_hit_rate(),
+                     profile.graph_cache_hits,
+                     profile.graph_cache_misses,
+                     profile.graph_cache_hit_rate());
+    }
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -932,7 +1174,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     if (!opt.vad_model_path.empty()) {
-        opt.use_vad = true;
         if (!fs::exists(opt.vad_model_path)) {
             std::fprintf(stderr, "VAD model file not found: %s\n", opt.vad_model_path.c_str());
             return 1;
@@ -974,18 +1215,26 @@ int main(int argc, char* argv[]) {
 
     if (opt.use_gpu) {
         std::fprintf(stderr, "[2] Initializing GPU device %d...\n", opt.gpu_id);
+        int gpu_slots = gpu_init_slots(opt);
         ScopedStdoutToStderr redirect;
-        if (!recognizer.init_gpu(2048, opt.gpu_id)) {
+        if (!recognizer.init_gpu(opt.ctx_size, opt.gpu_id, gpu_slots)) {
             std::fprintf(stderr, "Warning: GPU init failed, falling back to CPU\n");
             opt.use_gpu = false;
         }
     }
     std::fprintf(stderr, "[2] Mode: %s\n", opt.use_gpu ? "GPU" : "CPU");
+    apply_offline_paged_env_defaults(opt);
+
+    std::fprintf(stderr, "[3] Chunk mode: %s", chunk_mode_name(opt.chunk_mode));
+    if (opt.chunk_mode == ChunkMode::Window) {
+        std::fprintf(stderr, " (%d sec)", opt.chunk_sec);
+    }
+    std::fprintf(stderr, "\n");
 
     funasr::SileroVAD silero_vad;
-    bool use_silero_vad = opt.use_vad && !opt.vad_model_path.empty();
+    bool use_silero_vad = opt.chunk_mode == ChunkMode::Vad && !opt.vad_model_path.empty();
     if (use_silero_vad) {
-        std::fprintf(stderr, "[3] Loading Silero VAD: %s\n", opt.vad_model_path.c_str());
+        std::fprintf(stderr, "[4] Loading Silero VAD: %s\n", opt.vad_model_path.c_str());
         if (!silero_vad.init(opt.vad_model_path)) {
             std::fprintf(stderr, "Failed to init Silero VAD model\n");
             return 1;
@@ -995,6 +1244,7 @@ int main(int argc, char* argv[]) {
     funasr::InferenceConfig config;
     config.use_gpu = opt.use_gpu;
     config.gpu_id = opt.gpu_id;
+    config.kv_cache_size = opt.ctx_size;
     config.n_threads = opt.n_threads;
     config.max_new_tokens = opt.max_tokens;
 
@@ -1021,65 +1271,132 @@ int main(int argc, char* argv[]) {
             ? static_cast<float>(samples.size()) / sample_rate
             : 0.0f;
 
-        if (loaded && !opt.use_vad) {
+        if (loaded && opt.chunk_mode == ChunkMode::None) {
+            if (opt.offline_scheduler) {
+                std::fprintf(stderr,
+                             "Warning: --offline-scheduler requested with "
+                             "--chunk-mode none; using single-call transcription\n");
+            }
             funasr::InferenceResult result;
             {
                 ScopedStdoutToStderr redirect;
                 result = recognizer.transcribe_audio(samples.data(), samples.size(), config);
             }
-            item.text = result.text;
-        } else if (loaded && opt.use_vad) {
-            std::vector<AudioSegment> segments;
-            if (use_silero_vad) {
+            item.text = cleanup_repeated_text(result.text);
+        } else if (loaded) {
+            std::vector<funasr::AudioChunk> segments;
+            if (opt.chunk_mode == ChunkMode::Window) {
+                segments = funasr::split_audio_by_window(
+                    samples, static_cast<int>(sample_rate), opt.chunk_sec);
+                std::fprintf(stderr, "%s[Window] %s: %zu chunks (%d sec)\n",
+                             batch_mode ? "\n" : "", item.filename.c_str(),
+                             segments.size(), opt.chunk_sec);
+            } else if (use_silero_vad) {
                 auto vad_segments = silero_vad.detect(
                     samples.data(), samples.size(),
                     static_cast<int>(sample_rate),
                     opt.silero_vad);
-                segments = convert_silero_segments(
+                segments = funasr::convert_silero_segments_to_chunks(
                     vad_segments, samples.size(), static_cast<int>(sample_rate),
                     opt.silero_vad.samples_overlap);
                 std::fprintf(stderr, "%s[Silero VAD] %s: %zu segments\n",
                              batch_mode ? "\n" : "", item.filename.c_str(), segments.size());
-            } else {
-                segments = split_audio_by_vad(samples, static_cast<int>(sample_rate),
+            } else if (opt.chunk_mode == ChunkMode::Vad) {
+                segments = funasr::split_audio_by_energy_vad(samples, static_cast<int>(sample_rate),
                                               opt.max_segment_sec,
                                               opt.min_silence_ms,
                                               opt.segment_pad_ms,
                                               opt.energy_threshold);
                 std::fprintf(stderr, "%s[VAD] %s: %zu segments\n",
                              batch_mode ? "\n" : "", item.filename.c_str(), segments.size());
+            } else {
+                segments = funasr::split_audio_by_window(
+                    samples, static_cast<int>(sample_rate), opt.chunk_sec);
             }
 
-            for (size_t seg_idx = 0; seg_idx < segments.size(); seg_idx++) {
-                const auto& segment = segments[seg_idx];
-                size_t seg_len = segment.infer_end_sample > segment.infer_start_sample
-                    ? segment.infer_end_sample - segment.infer_start_sample
-                    : 0;
-                if (seg_len == 0) continue;
+            int max_llm_segment_sec = std::max(5, opt.ctx_size / 128);
+            size_t before_split = segments.size();
+            segments = funasr::split_chunks_by_max_duration(
+                segments, samples.size(), static_cast<int>(sample_rate), max_llm_segment_sec);
+            if (segments.size() != before_split) {
+                std::fprintf(stderr,
+                             "[VAD] Split long segments for LLM context: %zu -> %zu "
+                             "(max %d sec)\n",
+                             before_split, segments.size(), max_llm_segment_sec);
+            }
 
-                std::vector<float> segment_samples(
-                    samples.begin() + static_cast<std::ptrdiff_t>(segment.infer_start_sample),
-                    samples.begin() + static_cast<std::ptrdiff_t>(segment.infer_end_sample));
+            if (should_use_offline_scheduler(opt, loaded, segments.size())) {
+                if (opt.offline_kv_mode == OfflineKVMode::Paged && !opt.use_gpu) {
+                    std::fprintf(stderr,
+                                 "Warning: --kv-mode %s requested without GPU; "
+                                 "using CPU scheduler compatibility path\n",
+                                 offline_kv_mode_name(opt.offline_kv_mode));
+                }
 
-                funasr::InferenceResult result;
+                funasr::OfflineBatchConfig offline_cfg = make_offline_batch_config(opt);
+                funasr::OfflineBatchTranscriber transcriber(recognizer);
+                std::vector<funasr::OfflineChunkResult> offline_results;
                 {
                     ScopedStdoutToStderr redirect;
-                    result = recognizer.transcribe_audio(
-                        segment_samples.data(), segment_samples.size(), config);
+                    offline_results = transcriber.transcribe(
+                        samples, static_cast<int>(sample_rate), segments, offline_cfg);
                 }
 
-                if (!result.text.empty()) {
+                for (const auto& result : offline_results) {
+                    if (!result.ok || result.text.empty()) {
+                        continue;
+                    }
+                    std::string cleaned_text = cleanup_repeated_text(result.text);
+                    if (cleaned_text.empty()) {
+                        continue;
+                    }
                     SegmentResult seg_result;
-                    seg_result.text = result.text;
-                    seg_result.start_sec = segment.start_sec;
-                    seg_result.end_sec = segment.end_sec;
+                    seg_result.text = cleaned_text;
+                    seg_result.start_sec = result.start_sec;
+                    seg_result.end_sec = result.end_sec;
                     item.segments.push_back(seg_result);
-                    item.text = append_without_overlap(item.text, result.text);
+                    item.text = append_without_overlap(item.text, cleaned_text);
                 }
 
-                print_vad_progress(static_cast<int>(seg_idx + 1),
-                                   static_cast<int>(segments.size()),
-                                   segment, item.duration_sec);
+                if (opt.offline_profile) {
+                    print_offline_profile(transcriber.last_stats(), recognizer, opt);
+                }
+            } else {
+                for (size_t seg_idx = 0; seg_idx < segments.size(); seg_idx++) {
+                    const auto& segment = segments[seg_idx];
+                    size_t seg_len = segment.infer_end_sample > segment.infer_start_sample
+                        ? segment.infer_end_sample - segment.infer_start_sample
+                        : 0;
+                    if (seg_len == 0) continue;
+
+                    std::vector<float> segment_samples(
+                        samples.begin() + static_cast<std::ptrdiff_t>(segment.infer_start_sample),
+                        samples.begin() + static_cast<std::ptrdiff_t>(segment.infer_end_sample));
+
+                    funasr::InferenceResult result;
+                    {
+                        ScopedStdoutToStderr redirect;
+                        result = recognizer.transcribe_audio(
+                            segment_samples.data(), segment_samples.size(), config);
+                    }
+
+                    if (!result.text.empty()) {
+                        std::string cleaned_text = cleanup_repeated_text(result.text);
+                        if (cleaned_text.empty()) {
+                            continue;
+                        }
+                        SegmentResult seg_result;
+                        seg_result.text = cleaned_text;
+                        seg_result.start_sec = segment.start_sec;
+                        seg_result.end_sec = segment.end_sec;
+                        item.segments.push_back(seg_result);
+                        item.text = append_without_overlap(item.text, cleaned_text);
+                    }
+
+                    print_vad_progress(static_cast<int>(seg_idx + 1),
+                                       static_cast<int>(segments.size()),
+                                       segment, item.duration_sec);
+                }
             }
             std::fprintf(stderr, "\n");
         }

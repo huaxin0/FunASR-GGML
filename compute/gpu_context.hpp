@@ -24,6 +24,7 @@
 
 #include "core/config.hpp"
 #include "model/weights.hpp"
+#include <algorithm>
 #include <vector>
 #include <cstdio>
 #include <cstring>
@@ -66,6 +67,8 @@ struct GPULLMWeights {
 struct GPUKVCache {
     int n_ctx       = 0;
     int n_past      = 0;
+    int n_slots     = 1;
+    int physical_rows = 0;
     int n_layers    = 0;
     int kv_dim      = 0;      // n_kv_heads * head_dim = 1024
 
@@ -96,14 +99,14 @@ public:
     // gpu_id: CUDA 设备 ID
     // ============================================================
     bool init(const LLMWeights& cpu_weights, const LLMConfig& cfg,
-              int n_ctx = 2048, int gpu_id = 0)
+              int n_ctx = 2048, int gpu_id = 0, int n_slots = 1)
     {
         printf("\n========== GPUContext Init ==========\n");
         cfg_ = cfg;
 
         if (!init_backend(gpu_id)) return false;
         if (!load_weights(cpu_weights)) return false;
-        if (!init_kv_cache(n_ctx)) return false;
+        if (!init_kv_cache(n_ctx, n_slots)) return false;
 
         initialized_ = true;
         printf("========== GPUContext Ready ==========\n\n");
@@ -312,16 +315,19 @@ private:
     // ============================================================
     // 初始化 GPU KV Cache
     // ============================================================
-    bool init_kv_cache(int n_ctx) {
-        printf("[GPUContext] Init GPU KV Cache (n_ctx=%d)...\n", n_ctx);
+    bool init_kv_cache(int n_ctx, int n_slots = 1) {
+        n_slots = std::max(1, n_slots);
+        printf("[GPUContext] Init GPU KV Cache (n_ctx=%d, slots=%d)...\n", n_ctx, n_slots);
 
         kv_cache_.n_ctx    = n_ctx;
         kv_cache_.n_past   = 0;
+        kv_cache_.n_slots  = n_slots;
+        kv_cache_.physical_rows = n_ctx * n_slots;
         kv_cache_.n_layers = cfg_.block_count;
         kv_cache_.kv_dim   = cfg_.kv_dim();
 
         size_t n_elements = static_cast<size_t>(kv_cache_.kv_dim)
-                          * n_ctx * kv_cache_.n_layers;
+                          * kv_cache_.physical_rows * kv_cache_.n_layers;
 
         // 创建 tensor 元数据
         size_t ctx_size = ggml_tensor_overhead() * 4;
@@ -329,8 +335,8 @@ private:
         kv_cache_.ctx = ggml_init(params);
         if (!kv_cache_.ctx) return false;
 
-        kv_cache_.k = ggml_new_tensor_1d(kv_cache_.ctx, GGML_TYPE_F32, n_elements);
-        kv_cache_.v = ggml_new_tensor_1d(kv_cache_.ctx, GGML_TYPE_F32, n_elements);
+        kv_cache_.k = ggml_new_tensor_1d(kv_cache_.ctx, GGML_TYPE_F16, n_elements);
+        kv_cache_.v = ggml_new_tensor_1d(kv_cache_.ctx, GGML_TYPE_F16, n_elements);
 
         // GPU 分配
         kv_cache_.buffer = ggml_backend_alloc_ctx_tensors(kv_cache_.ctx, backend_);
@@ -343,8 +349,9 @@ private:
         ggml_backend_buffer_clear(kv_cache_.buffer, 0);
 
         kv_cache_.initialized = true;
-        printf("[GPUContext] KV Cache: K=%.1f MB, V=%.1f MB\n",
-               ggml_nbytes(kv_cache_.k) / 1e6, ggml_nbytes(kv_cache_.v) / 1e6);
+        printf("[GPUContext] KV Cache: K=%.1f MB, V=%.1f MB, physical_rows=%d\n",
+               ggml_nbytes(kv_cache_.k) / 1e6, ggml_nbytes(kv_cache_.v) / 1e6,
+               kv_cache_.physical_rows);
         return true;
     }
 };

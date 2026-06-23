@@ -6,13 +6,42 @@
 //   - RoPE: freq_base=1e6, mode=2 (neox), head_dim=128
 //   - QK Norm: RMSNorm on Q/K after projection
 //   - SwiGLU: gate(silu) * up → down
-//   - KV Cache: 拼接法 (concat 历史 + 当前, 图外 memcpy commit)
+//   - KV Cache: F16 cache + graph-internal ggml_cpy updates
+//   - Attention: ggml_flash_attn_ext (GQA without manual KV repeat)
 //
 #include "compute/llm_ops.hpp"
 #include <cmath>
 #include <cstdio>
 
 namespace funasr {
+
+namespace {
+
+void fill_causal_mask(ggml_tensor* mask, int n_past) {
+    if (!mask || !mask->data || mask->type != GGML_TYPE_F16) {
+        return;
+    }
+
+    const int n_kv = static_cast<int>(mask->ne[0]);
+    const int seq_len = static_cast<int>(mask->ne[1]);
+    const int n_broadcast = static_cast<int>(mask->ne[2] * mask->ne[3]);
+    ggml_fp16_t* data = static_cast<ggml_fp16_t*>(mask->data);
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+
+    for (int b = 0; b < n_broadcast; b++) {
+        size_t b_offset = static_cast<size_t>(b) * n_kv * seq_len;
+        for (int q_pos = 0; q_pos < seq_len; q_pos++) {
+            const int max_k_pos = n_past + q_pos;
+            for (int k_pos = 0; k_pos < n_kv; k_pos++) {
+                data[b_offset + static_cast<size_t>(q_pos) * n_kv + k_pos] =
+                    k_pos <= max_k_pos ? zero : neg_inf;
+            }
+        }
+    }
+}
+
+} // namespace
 
 // ============================================================
 // 辅助: RMSNorm
@@ -29,18 +58,17 @@ static ggml_tensor* rms_norm(
 }
 
 // ============================================================
-// GQA Attention with KV Cache (拼接法)
+// GQA Attention with KV Cache
 //
 // 流程:
 //   1. Q/K/V 投影 (无 bias)
 //   2. Reshape 3D
 //   3. Q/K RMSNorm + weight
 //   4. RoPE (ggml_rope_ext)
-//   5. K/V → 2D → pending (图外 commit)
-//   6. 构建完整 K/V (concat 历史 + 当前)
-//   7. GQA expansion (8 → 16 via ggml_repeat)
-//   8. Scaled Dot-Product Attention + Causal Mask
-//   9. Output projection
+//   5. K/V → 2D + ggml_cpy 写入 cache slot（图内执行）
+//   6. 从 cache 读取完整 K/V
+//   7. FlashAttention (GQA broadcast, causal mask)
+//   8. Output projection
 // ============================================================
 ggml_tensor* gqa_forward(
     ggml_context* ctx,
@@ -49,7 +77,8 @@ ggml_tensor* gqa_forward(
     KVCache& cache,
     int layer_idx,
     int n_past,
-    const LLMConfig& cfg
+    const LLMConfig& cfg,
+    std::vector<ggml_tensor*>& kv_cpy_ops
 ) {
     const int seq_len    = static_cast<int>(x->ne[1]);
     const int n_heads    = cfg.head_count;       // 16
@@ -87,32 +116,32 @@ ggml_tensor* gqa_forward(
     k_cur = ggml_rope_ext(ctx, k_cur, pos, nullptr, head_dim, 2, 32768,
                            cfg.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-    // ===== 5. K/V → 2D [kv_dim, seq_len] → pending =====
+    // ===== 5. K/V → 2D + ggml_cpy 写入 cache =====
     k_cur = ggml_reshape_2d(ctx, k_cur, kv_dim, seq_len);
     k_cur = ggml_cont(ctx, k_cur);
     v_cur = ggml_reshape_2d(ctx, v_cur, kv_dim, seq_len);
     v_cur = ggml_cont(ctx, v_cur);
 
-    cache.set_pending(layer_idx, k_cur, v_cur);
+    const size_t k_row_size = ggml_row_size(cache.k_tensor()->type, kv_dim);
+    const size_t v_row_size = ggml_row_size(cache.v_tensor()->type, kv_dim);
+    size_t k_layer_offset = static_cast<size_t>(layer_idx) * cache.n_ctx() * k_row_size;
+    size_t v_layer_offset = static_cast<size_t>(layer_idx) * cache.n_ctx() * v_row_size;
+    size_t k_pos_offset   = static_cast<size_t>(n_past) * k_row_size;
+    size_t v_pos_offset   = static_cast<size_t>(n_past) * v_row_size;
 
-    // ===== 6. 构建完整 K/V =====
-    ggml_tensor* k_full;
-    ggml_tensor* v_full;
+    ggml_tensor* k_slot = ggml_view_2d(ctx, cache.k_tensor(),
+        kv_dim, seq_len, k_row_size, k_layer_offset + k_pos_offset);
+    ggml_tensor* v_slot = ggml_view_2d(ctx, cache.v_tensor(),
+        kv_dim, seq_len, v_row_size, v_layer_offset + v_pos_offset);
 
-    if (n_past > 0) {
-        size_t layer_offset = static_cast<size_t>(layer_idx) * cache.n_ctx() * kv_dim * sizeof(float);
+    kv_cpy_ops.push_back(ggml_cpy(ctx, k_cur, k_slot));
+    kv_cpy_ops.push_back(ggml_cpy(ctx, v_cur, v_slot));
 
-        ggml_tensor* k_hist = ggml_view_2d(ctx, cache.k_tensor(),
-            kv_dim, n_past, kv_dim * sizeof(float), layer_offset);
-        ggml_tensor* v_hist = ggml_view_2d(ctx, cache.v_tensor(),
-            kv_dim, n_past, kv_dim * sizeof(float), layer_offset);
-
-        k_full = ggml_concat(ctx, k_hist, k_cur, 1);
-        v_full = ggml_concat(ctx, v_hist, v_cur, 1);
-    } else {
-        k_full = k_cur;
-        v_full = v_cur;
-    }
+    // ===== 6. 从 cache 读取完整 K/V =====
+    ggml_tensor* k_full = ggml_view_2d(ctx, cache.k_tensor(),
+        kv_dim, n_kv, k_row_size, k_layer_offset);
+    ggml_tensor* v_full = ggml_view_2d(ctx, cache.v_tensor(),
+        kv_dim, n_kv, v_row_size, v_layer_offset);
 
     // ===== 7. Reshape 3D + Permute for attention =====
     // K/V: [kv_dim, n_kv] → [head_dim, n_kv_heads, n_kv] → permute → [head_dim, n_kv, n_kv_heads]
@@ -125,51 +154,22 @@ ggml_tensor* gqa_forward(
     // Q: [head_dim, n_heads, seq_len] → permute → [head_dim, seq_len, n_heads]
     q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
 
-    // ===== 8. GQA Expansion (8 KV → 16 Q heads) =====
-    if (n_kv_heads < n_heads) {
-        int repeat_factor = n_heads / n_kv_heads;  // 2
+    // ===== 8. FlashAttention =====
+    q = ggml_reshape_4d(ctx, q, head_dim, seq_len, n_heads, 1);
+    k_full = ggml_reshape_4d(ctx, k_full, head_dim, n_kv, n_kv_heads, 1);
+    v_full = ggml_reshape_4d(ctx, v_full, head_dim, n_kv, n_kv_heads, 1);
 
-        // K: [head_dim, n_kv, n_kv_heads] → repeat → [head_dim, n_kv, n_heads]
-        k_full = ggml_reshape_4d(ctx, k_full, head_dim, n_kv, n_kv_heads, 1);
-        ggml_tensor* k_target = ggml_new_tensor_4d(ctx, k_full->type,
-            head_dim, n_kv, n_kv_heads, repeat_factor);
-        k_full = ggml_repeat(ctx, k_full, k_target);
-        k_full = ggml_cont(ctx, ggml_permute(ctx, k_full, 0, 1, 3, 2));
-        k_full = ggml_reshape_3d(ctx, k_full, head_dim, n_kv, n_heads);
-        k_full = ggml_cont(ctx, k_full);
+    ggml_tensor* mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, seq_len, 1, 1);
+    fill_causal_mask(mask, n_past);
 
-        // V: same
-        v_full = ggml_reshape_4d(ctx, v_full, head_dim, n_kv, n_kv_heads, 1);
-        ggml_tensor* v_target = ggml_new_tensor_4d(ctx, v_full->type,
-            head_dim, n_kv, n_kv_heads, repeat_factor);
-        v_full = ggml_repeat(ctx, v_full, v_target);
-        v_full = ggml_cont(ctx, ggml_permute(ctx, v_full, 0, 1, 3, 2));
-        v_full = ggml_reshape_3d(ctx, v_full, head_dim, n_kv, n_heads);
-        v_full = ggml_cont(ctx, v_full);
-    }
-
-    // ===== 9. Attention =====
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    q = ggml_scale(ctx, q, scale);
+    ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q, k_full, v_full, mask,
+                                                scale, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
 
-    // scores = K^T @ Q → [n_kv, seq_len, n_heads]
-    ggml_tensor* scores = ggml_mul_mat(ctx, k_full, q);
-
-    // Causal mask
-    scores = ggml_diag_mask_inf(ctx, scores, n_past);
-
-    // Softmax
-    ggml_tensor* attn = ggml_soft_max(ctx, scores);
-
-    // V: [head_dim, n_kv, n_heads] → permute → [n_kv, head_dim, n_heads]
-    v_full = ggml_cont(ctx, ggml_permute(ctx, v_full, 1, 0, 2, 3));
-
-    // attn_out = V^T @ attn → [head_dim, seq_len, n_heads]
-    ggml_tensor* attn_out = ggml_mul_mat(ctx, v_full, attn);
-
-    // ===== 10. Output projection =====
-    // [head_dim, seq_len, n_heads] → permute → [head_dim, n_heads, seq_len] → reshape [q_dim, seq_len]
-    attn_out = ggml_cont(ctx, ggml_permute(ctx, attn_out, 0, 2, 1, 3));
+    // ===== 9. Output projection =====
+    // ggml_flash_attn_ext returns [head_dim, n_heads, seq_len, 1].
+    attn_out = ggml_cont(ctx, attn_out);
     attn_out = ggml_reshape_2d(ctx, attn_out, n_heads * head_dim, seq_len);
 
     return ggml_mul_mat(ctx, layer.o_proj_w, attn_out);
@@ -185,14 +185,16 @@ ggml_tensor* llm_layer_forward(
     KVCache& cache,
     int layer_idx,
     int n_past,
-    const LLMConfig& cfg
+    const LLMConfig& cfg,
+    std::vector<ggml_tensor*>& kv_cpy_ops
 ) {
     const float eps = 1e-5f;
 
     // ===== Attention Block =====
     ggml_tensor* residual = x;
     ggml_tensor* x_norm = rms_norm(ctx, x, layer.input_norm_w, eps);
-    ggml_tensor* attn_out = gqa_forward(ctx, x_norm, layer, cache, layer_idx, n_past, cfg);
+    ggml_tensor* attn_out = gqa_forward(
+        ctx, x_norm, layer, cache, layer_idx, n_past, cfg, kv_cpy_ops);
     x = ggml_add(ctx, residual, attn_out);
 
     // ===== MLP Block (SwiGLU) =====
@@ -218,14 +220,15 @@ ggml_tensor* llm_forward(
     const LLMWeights& weights,
     KVCache& cache,
     int n_past,
-    const LLMConfig& cfg
+    const LLMConfig& cfg,
+    std::vector<ggml_tensor*>& kv_cpy_ops
 ) {
     const float eps = 1e-5f;
     ggml_tensor* x = hidden_states;
 
     // 28 Layers
     for (int i = 0; i < cfg.block_count; i++) {
-        x = llm_layer_forward(ctx, x, weights.layers[i], cache, i, n_past, cfg);
+        x = llm_layer_forward(ctx, x, weights.layers[i], cache, i, n_past, cfg, kv_cpy_ops);
     }
 
     // Final RMSNorm

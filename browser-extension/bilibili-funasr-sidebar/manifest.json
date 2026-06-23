@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "FunASR-GGML Bilibili Sidebar",
+  "version": "0.1.0",
+  "description": "Analyze the current Bilibili video with a local FunASR-GGML service.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://www.bilibili.com/*",
+    "http://127.0.0.1:*/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://www.bilibili.com/video/*"],
+      "js": ["content.js"],
+      "css": ["sidebar.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

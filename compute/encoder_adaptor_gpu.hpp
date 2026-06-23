@@ -109,7 +109,10 @@ public:
 
         ggml_tensor* fbank = ggml_new_tensor_2d(ctx_enc.get(), GGML_TYPE_F32, fbank_dim, frames);
         ggml_set_input(fbank);
+        bool prev_fsmn_fused = fsmn_fused_cuda_enabled();
+        set_fsmn_fused_cuda_enabled(true);
         ggml_tensor* enc_out = encoder_forward(ctx_enc.get(), fbank, encoder_weights_, encoder_cfg_);
+        set_fsmn_fused_cuda_enabled(prev_fsmn_fused);
         ggml_set_output(enc_out);
 
         ggml_cgraph* graph_enc = ggml_new_graph_custom(ctx_enc.get(), 131072, false);
@@ -259,7 +262,10 @@ public:
 
         ggml_tensor* fbank = ggml_new_tensor_2d(ctx_enc, GGML_TYPE_F32, fbank_dim, frames);
         ggml_set_input(fbank);
+        bool prev_fsmn_fused = fsmn_fused_cuda_enabled();
+        set_fsmn_fused_cuda_enabled(true);
         ggml_tensor* enc_out = encoder_forward(ctx_enc, fbank, encoder_weights_, encoder_cfg_);
+        set_fsmn_fused_cuda_enabled(prev_fsmn_fused);
         ggml_set_output(enc_out);
 
         ggml_cgraph* graph_enc = ggml_new_graph_custom(ctx_enc, 131072, false);

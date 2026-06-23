@@ -215,13 +215,12 @@ void test_end_to_end(
 
             auto t2 = std::chrono::high_resolution_clock::now();
 
+            std::vector<ggml_tensor*> kv_cpy_ops;
             struct ggml_tensor* logits = funasr::llm_forward(
-                ctx_prefill, embeds_t, model.llm, cache, 0, model.config.llm);
+                ctx_prefill, embeds_t, model.llm, cache, 0, model.config.llm, kv_cpy_ops);
 
-            funasr::run_graph(ctx_prefill, logits, 4);
+            funasr::run_graph(ctx_prefill, kv_cpy_ops, logits, 4);
 
-            // commit KV cache (在 free 之前!)
-            cache.commit(0, total_len);
             cache.set_n_past(total_len);
 
             auto t3 = std::chrono::high_resolution_clock::now();
@@ -273,13 +272,12 @@ void test_end_to_end(
             get_token_embedding(model.llm.embed_tokens, next_token,
                                 (float*)new_embed->data, embed_dim);
 
+            std::vector<ggml_tensor*> kv_cpy_ops;
             struct ggml_tensor* logits = funasr::llm_forward(
-                ctx_dec, new_embed, model.llm, cache, cache.n_past(), model.config.llm);
+                ctx_dec, new_embed, model.llm, cache, cache.n_past(), model.config.llm, kv_cpy_ops);
 
-            funasr::run_graph(ctx_dec, logits, 4);
+            funasr::run_graph(ctx_dec, kv_cpy_ops, logits, 4);
 
-            // commit + save logits (在 free 之前!)
-            cache.commit(cache.n_past(), 1);
             cache.set_n_past(cache.n_past() + 1);
 
             float* last_logits = (float*)logits->data;  // seq_len=1, 只有一个位置

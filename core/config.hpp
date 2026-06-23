@@ -4,6 +4,7 @@
 #include <gguf.h>
 #include <string>
 #include <cstdio>
+#include <cstdint>
 
 namespace funasr {
 

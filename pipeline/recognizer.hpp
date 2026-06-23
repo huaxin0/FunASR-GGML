@@ -73,12 +73,12 @@ public:
     // ============================================================
     // GPU 初始化（可选，在 init() 之后调用）
     // ============================================================
-    bool init_gpu(int n_ctx = 2048, int gpu_id = 0) {
+    bool init_gpu(int n_ctx = 2048, int gpu_id = 0, int n_slots = 1) {
         if (!ready_ || !pipeline_) {
             last_error_ = "Call init() before init_gpu()";
             return false;
         }
-        if (!pipeline_->init_gpu(n_ctx, gpu_id)) {
+        if (!pipeline_->init_gpu(n_ctx, gpu_id, n_slots)) {
             last_error_ = "Failed to init GPU";
             return false;
         }
@@ -117,6 +117,103 @@ public:
             return InferenceResult{};
         }
         return pipeline_->transcribe_audio(audio, n_samples, config, callback);
+    }
+
+    // ============================================================
+    // 离线 batching 辅助接口：先准备 LLM 输入，再执行 LLM
+    // ============================================================
+    PreparedLLMInput prepare_llm_input(
+        const float* audio, size_t n_samples,
+        const InferenceConfig& config = InferenceConfig()
+    ) {
+        if (!ready_) {
+            last_error_ = "Not initialized";
+            return PreparedLLMInput{};
+        }
+        return pipeline_->prepare_llm_input(audio, n_samples, config);
+    }
+
+    InferenceResult run_prepared(
+        const PreparedLLMInput& prepared,
+        const InferenceConfig& config = InferenceConfig(),
+        TokenCallback callback = nullptr
+    ) {
+        if (!ready_) {
+            last_error_ = "Not initialized";
+            return InferenceResult{};
+        }
+        return pipeline_->run_prepared(prepared, config, callback);
+    }
+
+    std::vector<InferenceResult> run_prepared_batch(
+        const std::vector<PreparedLLMInput>& prepared,
+        const std::vector<int>& slot_ids,
+        const InferenceConfig& config = InferenceConfig()
+    ) {
+        if (!ready_) {
+            last_error_ = "Not initialized";
+            return {};
+        }
+        return pipeline_->run_prepared_batch(prepared, slot_ids, config);
+    }
+
+    std::vector<InferenceResult> transcribe_audio_batch_gpu(
+        const std::vector<AudioSpan>& audio,
+        const std::vector<int>& slot_ids,
+        const InferenceConfig& config = InferenceConfig()
+    ) {
+        if (!ready_) {
+            last_error_ = "Not initialized";
+            return {};
+        }
+        return pipeline_->transcribe_audio_batch_gpu(audio, slot_ids, config);
+    }
+
+    GPUPrefillState gpu_prefill_audio_slot(
+        const AudioSpan& audio,
+        int request_id,
+        int slot_id,
+        const InferenceConfig& config = InferenceConfig()
+    ) {
+        if (!ready_) {
+            last_error_ = "Not initialized";
+            return {};
+        }
+        return pipeline_->gpu_prefill_audio_slot(audio, request_id, slot_id, config);
+    }
+
+    GPUPrefillState gpu_prefill_audio_paged(
+        const AudioSpan& audio,
+        int request_id,
+        const std::vector<int>& block_table,
+        int block_size,
+        const InferenceConfig& config = InferenceConfig()
+    ) {
+        if (!ready_) {
+            last_error_ = "Not initialized";
+            return {};
+        }
+        return pipeline_->gpu_prefill_audio_paged(
+            audio, request_id, block_table, block_size, config);
+    }
+
+    std::vector<GPUDecodeStepOutput> gpu_decode_step_slots(
+        const std::vector<GPUDecodeStepInput>& inputs,
+        const InferenceConfig& config = InferenceConfig(),
+        GPUDecodeDispatchStats* dispatch_stats = nullptr
+    ) {
+        if (!ready_) {
+            last_error_ = "Not initialized";
+            return {};
+        }
+        return pipeline_->gpu_decode_step_slots(inputs, config, dispatch_stats);
+    }
+
+    PagedDecodeProfile gpu_paged_decode_profile() const {
+        if (!ready_) {
+            return PagedDecodeProfile{};
+        }
+        return pipeline_->gpu_paged_decode_profile();
     }
 
     // ============================================================

@@ -17,6 +17,7 @@
 #include "core/config.hpp"
 #include "model/weights.hpp"
 #include "compute/kv_cache.hpp"
+#include <vector>
 
 namespace funasr {
 
@@ -28,7 +29,8 @@ ggml_tensor* gqa_forward(
     KVCache& cache,
     int layer_idx,
     int n_past,
-    const LLMConfig& cfg
+    const LLMConfig& cfg,
+    std::vector<ggml_tensor*>& kv_cpy_ops
 );
 
 // 单层 Transformer (RMSNorm→GQA→Residual + RMSNorm→SwiGLU→Residual)
@@ -39,7 +41,8 @@ ggml_tensor* llm_layer_forward(
     KVCache& cache,
     int layer_idx,
     int n_past,
-    const LLMConfig& cfg
+    const LLMConfig& cfg,
+    std::vector<ggml_tensor*>& kv_cpy_ops
 );
 
 // 完整 LLM Decoder forward
@@ -51,7 +54,8 @@ ggml_tensor* llm_forward(
     const LLMWeights& weights,
     KVCache& cache,
     int n_past,
-    const LLMConfig& cfg
+    const LLMConfig& cfg,
+    std::vector<ggml_tensor*>& kv_cpy_ops
 );
 
 } // namespace funasr

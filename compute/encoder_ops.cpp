@@ -11,6 +11,18 @@
 
 namespace funasr {
 
+namespace {
+thread_local bool g_fsmn_fused_cuda_enabled = false;
+}
+
+void set_fsmn_fused_cuda_enabled(bool enabled) {
+    g_fsmn_fused_cuda_enabled = enabled;
+}
+
+bool fsmn_fused_cuda_enabled() {
+    return g_fsmn_fused_cuda_enabled;
+}
+
 // ============================================================
 // 辅助: LayerNorm (ggml_norm + affine)
 // ============================================================
@@ -61,6 +73,10 @@ ggml_tensor* fsmn_forward(
     int kernel_size,
     int pad
 ) {
+    if (fsmn_fused_cuda_enabled()) {
+        return ggml_fsmn_ext(ctx, v, fsmn_w, pad);
+    }
+
     const int dim = static_cast<int>(v->ne[0]);
     const int T   = static_cast<int>(v->ne[1]);
     const int K   = kernel_size;

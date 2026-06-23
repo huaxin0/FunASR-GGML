@@ -14,6 +14,7 @@
 #include "model/model.hpp"
 #include "model/tokenizer.hpp"
 #include "compute/fbank.hpp"
+#include "compute/gpu_profile.hpp"
 #include "compute/kv_cache.hpp"
 #include "pipeline/prompt_builder.hpp"
 #ifdef FUNASR_USE_CUDA
@@ -47,6 +48,58 @@ struct InferenceResult {
     int   decode_tokens  = 0;      // 生成 token 数
 };
 
+// Prepared LLM input for offline batching.
+// It contains prompt + audio embeddings + suffix embeddings as one sequence:
+// [embed_dim, total_len] in row-major token order compatible with existing code.
+struct PreparedLLMInput {
+    std::vector<float> inputs_embeds;
+    int total_len = 0;
+    int audio_frames = 0;
+    float encoder_ms = 0.0f;
+    bool ok = false;
+};
+
+struct AudioSpan {
+    const float* data = nullptr;
+    size_t n_samples = 0;
+};
+
+struct GPUPrefillState {
+    int request_id = -1;
+    int slot_id = -1;
+    int n_past = 0;
+    int block_size = 0;
+    std::vector<int> block_table;
+    std::vector<float> logits;
+    InferenceResult stats;
+    bool ok = false;
+};
+
+struct GPUDecodeStepInput {
+    int request_id = -1;
+    int slot_id = -1;
+    int n_past = 0;
+    int token_id = -1;
+    const float* token_embed = nullptr;
+    int block_size = 0;
+    std::vector<int> block_table;
+};
+
+struct GPUDecodeStepOutput {
+    int request_id = -1;
+    int n_past = 0;
+    int next_token = -1;
+    std::vector<float> logits;
+    bool ok = false;
+};
+
+struct GPUDecodeDispatchStats {
+    int token_id_fast_path_unavailable = 0;
+    int host_embedding_batch_unavailable = 0;
+    int serial_env_forced = 0;
+    int invalid_paged_input = 0;
+};
+
 // 推理配置
 struct InferenceConfig {
     int max_new_tokens = 100;       // 最大生成 token 数
@@ -58,6 +111,9 @@ struct InferenceConfig {
     // GPU 选项
     bool use_gpu       = false;     // true = LLM 在 GPU 上跑
     int  gpu_id        = 0;         // CUDA 设备 ID
+
+    // Prompt 选项
+    PromptOptions prompt;           // 热词、语言、文本规整提示
 };
 
 class Pipeline {
@@ -69,7 +125,7 @@ public:
     // GPU 初始化（可选，只在 use_gpu=true 时需要）
     // 必须在第一次 run() 之前调用
     // ============================================================
-    bool init_gpu(int n_ctx = 2048, int gpu_id = 0);
+    bool init_gpu(int n_ctx = 2048, int gpu_id = 0, int n_slots = 1);
     bool is_gpu_ready() const;
 
     // ============================================================
@@ -80,6 +136,55 @@ public:
         const InferenceConfig& config = InferenceConfig(),
         TokenCallback callback = nullptr
     );
+
+    // ============================================================
+    // Offline batching helpers
+    // ============================================================
+    PreparedLLMInput prepare_llm_input(
+        const float* audio, size_t n_samples,
+        const InferenceConfig& config = InferenceConfig()
+    );
+
+    InferenceResult run_prepared(
+        const PreparedLLMInput& prepared,
+        const InferenceConfig& config = InferenceConfig(),
+        TokenCallback callback = nullptr
+    );
+
+    std::vector<InferenceResult> run_prepared_batch(
+        const std::vector<PreparedLLMInput>& prepared,
+        const std::vector<int>& slot_ids,
+        const InferenceConfig& config = InferenceConfig()
+    );
+
+    std::vector<InferenceResult> transcribe_audio_batch_gpu(
+        const std::vector<AudioSpan>& audio,
+        const std::vector<int>& slot_ids,
+        const InferenceConfig& config = InferenceConfig()
+    );
+
+    GPUPrefillState gpu_prefill_audio_slot(
+        const AudioSpan& audio,
+        int request_id,
+        int slot_id,
+        const InferenceConfig& config = InferenceConfig()
+    );
+
+    GPUPrefillState gpu_prefill_audio_paged(
+        const AudioSpan& audio,
+        int request_id,
+        const std::vector<int>& block_table,
+        int block_size,
+        const InferenceConfig& config = InferenceConfig()
+    );
+
+    std::vector<GPUDecodeStepOutput> gpu_decode_step_slots(
+        const std::vector<GPUDecodeStepInput>& inputs,
+        const InferenceConfig& config = InferenceConfig(),
+        GPUDecodeDispatchStats* dispatch_stats = nullptr
+    );
+
+    PagedDecodeProfile gpu_paged_decode_profile() const;
 
     // ============================================================
     // 便捷接口：从 WAV 文件推理
@@ -114,6 +219,25 @@ private:
         ggml_tensor* gpu_adaptor_tensor, int audio_frames,
         const float* cpu_adaptor_data,   // fallback: 没有 GPU tensor 时用
         const InferenceConfig& config, TokenCallback callback);
+
+#ifdef FUNASR_USE_CUDA
+    bool gpu_prefill_slot(
+        ggml_tensor* gpu_adaptor_tensor, int audio_frames,
+        const float* cpu_adaptor_data,
+        int slot_id,
+        const InferenceConfig& config,
+        std::vector<float>& logits,
+        InferenceResult& result);
+
+    bool gpu_prefill_paged(
+        ggml_tensor* gpu_adaptor_tensor, int audio_frames,
+        const float* cpu_adaptor_data,
+        const std::vector<int>& block_table,
+        int block_size,
+        const InferenceConfig& config,
+        std::vector<float>& logits,
+        InferenceResult& result);
+#endif
 
     static int argmax(const float* logits, int vocab_size);
 

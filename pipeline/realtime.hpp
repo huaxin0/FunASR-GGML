@@ -19,6 +19,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <algorithm>
 
 namespace funasr {
 
@@ -43,7 +44,8 @@ using UtteranceCallback = std::function<void(
     int utterance_id,
     const std::string& text,
     float audio_sec,
-    float inference_ms
+    float inference_ms,
+    float first_token_ms
 )>;
 
 class RealtimeRecognizer {
@@ -247,10 +249,18 @@ private:
 
                 // 推理
                 auto t_start = std::chrono::high_resolution_clock::now();
+                float first_token_ms = -1.0f;
 
                 auto result = recognizer_.transcribe_audio(
                     speech_buffer.data(), speech_buffer.size(),
-                    config_.inference);
+                    config_.inference,
+                    [&](int, const std::string&, bool is_final) {
+                        if (!is_final && first_token_ms < 0.0f) {
+                            auto t_first = std::chrono::high_resolution_clock::now();
+                            first_token_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                t_first - t_start).count();
+                        }
+                    });
 
                 auto t_end = std::chrono::high_resolution_clock::now();
                 float ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -266,11 +276,17 @@ private:
                     total_inference_ms_ += static_cast<long>(ms);
 
                     if (callback_) {
-                        callback_(utterance_count_, result.text, audio_sec, ms);
+                        callback_(utterance_count_, result.text, audio_sec, ms, first_token_ms);
                     } else {
-                        printf("[%d] %s  (%.1fs, %.0fms, RTF=%.2f)\n",
-                               utterance_count_, result.text.c_str(),
-                               audio_sec, ms, ms / (audio_sec * 1000));
+                        if (first_token_ms >= 0.0f) {
+                            printf("[%d] %s  (%.1fs, %.0fms, TTFT=%.0fms, RTF=%.2f)\n",
+                                   utterance_count_, result.text.c_str(),
+                                   audio_sec, ms, first_token_ms, ms / (audio_sec * 1000));
+                        } else {
+                            printf("[%d] %s  (%.1fs, %.0fms, TTFT=n/a, RTF=%.2f)\n",
+                                   utterance_count_, result.text.c_str(),
+                                   audio_sec, ms, ms / (audio_sec * 1000));
+                        }
                     }
                 }
 
@@ -281,6 +297,97 @@ private:
             }
         }
     }
+};
+
+class PushToTalkRecorder {
+public:
+    PushToTalkRecorder(int sample_rate = 16000, int max_record_ms = 30000)
+        : sample_rate_(std::max(1, sample_rate))
+        , max_record_ms_(std::max(1, max_record_ms))
+    {}
+
+    void start() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        samples_.clear();
+        recording_ = true;
+        truncated_ = false;
+    }
+
+    std::vector<float> stop() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        recording_ = false;
+        std::vector<float> out;
+        out.swap(samples_);
+        return out;
+    }
+
+    void feed_audio(const float* samples, size_t count) {
+        if (!samples || count == 0) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!recording_) return;
+
+        const size_t cap = max_samples_unlocked();
+        if (samples_.size() >= cap) {
+            truncated_ = true;
+            return;
+        }
+
+        size_t remaining = cap - samples_.size();
+        size_t to_copy = std::min(remaining, count);
+        samples_.insert(samples_.end(), samples, samples + to_copy);
+        if (to_copy < count) {
+            truncated_ = true;
+        }
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        samples_.clear();
+        recording_ = false;
+        truncated_ = false;
+    }
+
+    bool is_recording() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return recording_;
+    }
+
+    bool was_truncated() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return truncated_;
+    }
+
+    size_t sample_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return samples_.size();
+    }
+
+    size_t max_samples() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return max_samples_unlocked();
+    }
+
+    float duration_sec() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return static_cast<float>(samples_.size()) / static_cast<float>(sample_rate_);
+    }
+
+    float max_duration_sec() const {
+        return static_cast<float>(max_record_ms_) / 1000.0f;
+    }
+
+private:
+    size_t max_samples_unlocked() const {
+        return static_cast<size_t>(sample_rate_) *
+               static_cast<size_t>(max_record_ms_) / 1000;
+    }
+
+    int sample_rate_ = 16000;
+    int max_record_ms_ = 30000;
+    mutable std::mutex mutex_;
+    std::vector<float> samples_;
+    bool recording_ = false;
+    bool truncated_ = false;
 };
 
 } // namespace funasr

@@ -40,6 +40,31 @@ inline bool run_graph(
     return true;
 }
 
+inline bool run_graph(
+    struct ggml_context* ctx,
+    const std::vector<struct ggml_tensor*>& pre_ops,
+    struct ggml_tensor* output,
+    int n_threads = 4,
+    int max_nodes = 131072
+) {
+    struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, max_nodes, false);
+    for (auto* op : pre_ops) {
+        ggml_build_forward_expand(gf, op);
+    }
+    ggml_build_forward_expand(gf, output);
+
+    struct ggml_cplan plan = ggml_graph_plan(gf, n_threads, nullptr);
+
+    std::vector<uint8_t> work_buf;
+    if (plan.work_size > 0) {
+        work_buf.resize(plan.work_size);
+        plan.work_data = work_buf.data();
+    }
+
+    ggml_graph_compute(gf, &plan);
+    return true;
+}
+
 } // namespace funasr
 
 #endif // FUNASR_COMPUTE_GRAPH_RUNNER_HPP
