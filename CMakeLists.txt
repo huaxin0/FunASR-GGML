@@ -55,6 +55,7 @@ add_library(funasr_compute STATIC
     compute/encoder_ops.cpp
     compute/adaptor_ops.cpp
     compute/llm_ops.cpp
+    compute/gpu_embedding_pool.cpp
     compute/silero_vad.cpp
 )
 if(FUNASR_CUDA)
@@ -139,6 +140,9 @@ if(FUNASR_BUILD_TESTS AND EXISTS "${CMAKE_SOURCE_DIR}/test/test_config.cpp")
 
     add_executable(test_unified_scheduler test/test_unified_scheduler.cpp)
     target_link_libraries(test_unified_scheduler PRIVATE funasr_pipeline)
+
+    add_executable(test_gpu_embedding_pool test/test_gpu_embedding_pool.cpp)
+    target_link_libraries(test_gpu_embedding_pool PRIVATE funasr_compute)
 
     add_executable(test_realtime test/test_realtime.cpp)
     target_link_libraries(test_realtime PRIVATE funasr_pipeline)
