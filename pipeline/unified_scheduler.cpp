@@ -62,6 +62,8 @@ MixedBatchPlan UnifiedTokenScheduler::build_plan(
                                     request.max_schedulable_tokens});
         if (count > 0) {
             schedule(static_cast<int>(i), count, UnifiedInputKind::Prompt);
+            plan.sequences.back().produces_logits =
+                request.num_computed_tokens + count == request.prompt_tokens;
         }
     }
 

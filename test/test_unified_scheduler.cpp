@@ -78,12 +78,63 @@ void test_decode_first_mixed_token_budget_plan() {
     }
 }
 
+void test_only_final_prefill_chunk_produces_logits() {
+    std::printf("\n--- Test 2: Final prefill chunk produces logits ---\n");
+
+    funasr::UnifiedSchedulerConfig config;
+    config.max_num_seqs = 1;
+    config.max_num_scheduled_tokens = 128;
+    config.max_prefill_chunk_tokens = 128;
+
+    funasr::UnifiedRequestProgress request;
+    request.request_id = 30;
+    request.prompt_tokens = 522;
+    request.num_computed_tokens = 256;
+    request.max_output_tokens = 220;
+    request.max_schedulable_tokens = 522;
+    request.runnable = true;
+    request.finished = false;
+
+    const funasr::UnifiedTokenScheduler scheduler(config);
+    std::vector<funasr::UnifiedRequestProgress> requests = {request};
+
+    const funasr::MixedBatchPlan middle_plan = scheduler.build_plan(requests);
+    TEST_ASSERT(middle_plan.ok(), "middle prefill plan should be valid");
+    TEST_EQ((int)middle_plan.sequences.size(), 1,
+            "middle prefill sequence count");
+    if (middle_plan.sequences.size() == 1) {
+        const funasr::ScheduledSequence& middle = middle_plan.sequences[0];
+        TEST_ASSERT(middle.input_kind == funasr::UnifiedInputKind::Prompt,
+                    "middle prefill input kind");
+        TEST_EQ(middle.token_offset, 256, "middle prefill token offset");
+        TEST_EQ(middle.num_tokens, 128, "middle prefill token count");
+        TEST_ASSERT(!middle.produces_logits,
+                    "middle prefill chunk should not produce logits");
+    }
+
+    requests[0].num_computed_tokens = 512;
+    const funasr::MixedBatchPlan final_plan = scheduler.build_plan(requests);
+    TEST_ASSERT(final_plan.ok(), "final prefill plan should be valid");
+    TEST_EQ((int)final_plan.sequences.size(), 1,
+            "final prefill sequence count");
+    if (final_plan.sequences.size() == 1) {
+        const funasr::ScheduledSequence& final = final_plan.sequences[0];
+        TEST_ASSERT(final.input_kind == funasr::UnifiedInputKind::Prompt,
+                    "final prefill input kind");
+        TEST_EQ(final.token_offset, 512, "final prefill token offset");
+        TEST_EQ(final.num_tokens, 10, "final prefill token count");
+        TEST_ASSERT(final.produces_logits,
+                    "final prefill chunk should produce logits");
+    }
+}
+
 int main() {
     std::printf("========================================\n");
     std::printf("Unified Scheduler Unit Tests\n");
     std::printf("========================================\n");
 
     test_decode_first_mixed_token_budget_plan();
+    test_only_final_prefill_chunk_produces_logits();
 
     std::printf("\n========================================\n");
     std::printf("Tests passed: %d\n", tests_passed);
