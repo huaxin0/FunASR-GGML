@@ -128,7 +128,7 @@ MixedBatchPlan UnifiedTokenScheduler::build_plan(
 bool UnifiedTokenScheduler::commit_sequence(
     UnifiedRequestProgress& request,
     const ScheduledSequence& scheduled) {
-    if (!request.valid() || request.finished ||
+    if (!request.valid() || !request.runnable || request.finished ||
         scheduled.request_id != request.request_id ||
         scheduled.num_tokens <= 0 ||
         scheduled.token_offset != request.num_computed_tokens ||
@@ -144,7 +144,7 @@ SampleCommitResult UnifiedTokenScheduler::commit_sample(
     UnifiedRequestProgress& request,
     int token_id,
     int eos_id) {
-    if (!request.valid() || request.finished ||
+    if (!request.valid() || !request.runnable || request.finished ||
         request.num_computed_tokens !=
             static_cast<int64_t>(request.prompt_tokens) +
                 static_cast<int64_t>(request.output_tokens.size())) {

@@ -193,8 +193,84 @@ void test_commit_prompt_then_schedule_first_decode_input() {
             "EOS is not included in output tokens");
 }
 
+void test_invalid_commit_does_not_advance_request() {
+    std::printf("\n--- Test 4: Invalid commit preserves request state ---\n");
+
+    funasr::UnifiedRequestProgress request;
+    request.request_id = 45;
+    request.prompt_tokens = 4;
+    request.num_computed_tokens = 2;
+    request.max_output_tokens = 4;
+
+    funasr::ScheduledSequence scheduled;
+    scheduled.request_id = 45;
+    scheduled.token_offset = 2;
+    scheduled.num_tokens = 2;
+    scheduled.input_kind = funasr::UnifiedInputKind::Prompt;
+
+    auto candidate = request;
+    auto invalid = scheduled;
+    invalid.request_id = 46;
+    TEST_ASSERT(!funasr::UnifiedTokenScheduler::commit_sequence(
+                    candidate, invalid),
+                "mismatched request id is rejected");
+    TEST_EQ(candidate.num_computed_tokens, 2,
+            "request id mismatch preserves progress");
+
+    candidate = request;
+    invalid = scheduled;
+    invalid.token_offset = 1;
+    TEST_ASSERT(!funasr::UnifiedTokenScheduler::commit_sequence(
+                    candidate, invalid),
+                "mismatched token offset is rejected");
+    TEST_EQ(candidate.num_computed_tokens, 2,
+            "offset mismatch preserves progress");
+
+    candidate = request;
+    invalid = scheduled;
+    invalid.num_tokens = 0;
+    TEST_ASSERT(!funasr::UnifiedTokenScheduler::commit_sequence(
+                    candidate, invalid),
+                "zero token sequence is rejected");
+
+    candidate = request;
+    invalid = scheduled;
+    invalid.num_tokens = 3;
+    TEST_ASSERT(!funasr::UnifiedTokenScheduler::commit_sequence(
+                    candidate, invalid),
+                "sequence beyond available tokens is rejected");
+    TEST_EQ(candidate.num_computed_tokens, 2,
+            "capacity mismatch preserves progress");
+
+    candidate = request;
+    candidate.runnable = false;
+    TEST_ASSERT(!funasr::UnifiedTokenScheduler::commit_sequence(
+                    candidate, scheduled),
+                "non-runnable sequence commit is rejected");
+    TEST_EQ(candidate.num_computed_tokens, 2,
+            "non-runnable sequence preserves progress");
+
+    candidate = request;
+    TEST_ASSERT(funasr::UnifiedTokenScheduler::commit_sample(
+                    candidate, 10, 99) ==
+                    funasr::SampleCommitResult::Invalid,
+                "sample commit requires aligned computed state");
+    TEST_EQ((int)candidate.output_tokens.size(), 0,
+            "invalid sample does not append a token");
+
+    candidate = request;
+    candidate.num_computed_tokens = 4;
+    candidate.runnable = false;
+    TEST_ASSERT(funasr::UnifiedTokenScheduler::commit_sample(
+                    candidate, 10, 99) ==
+                    funasr::SampleCommitResult::Invalid,
+                "non-runnable sample commit is rejected");
+    TEST_EQ((int)candidate.output_tokens.size(), 0,
+            "non-runnable sample does not append a token");
+}
+
 void test_validation_capacity_and_sequence_limit() {
-    std::printf("\n--- Test 4: Validation and capacity limits ---\n");
+    std::printf("\n--- Test 5: Validation and capacity limits ---\n");
 
     const funasr::UnifiedSchedulerConfig config{1, 8, 8};
     const funasr::UnifiedTokenScheduler scheduler(config);
@@ -290,6 +366,7 @@ int main() {
     test_decode_first_mixed_token_budget_plan();
     test_only_final_prefill_chunk_produces_logits();
     test_commit_prompt_then_schedule_first_decode_input();
+    test_invalid_commit_does_not_advance_request();
     test_validation_capacity_and_sequence_limit();
 
     std::printf("\n========================================\n");
