@@ -1,6 +1,7 @@
 #include "pipeline/unified_scheduler.hpp"
 
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 static int tests_passed = 0;
@@ -192,6 +193,78 @@ void test_commit_prompt_then_schedule_first_decode_input() {
             "EOS is not included in output tokens");
 }
 
+void test_validation_capacity_and_sequence_limit() {
+    std::printf("\n--- Test 4: Validation and capacity limits ---\n");
+
+    const funasr::UnifiedSchedulerConfig config{1, 8, 8};
+    const funasr::UnifiedTokenScheduler scheduler(config);
+
+    funasr::UnifiedRequestProgress blocked_decode;
+    blocked_decode.request_id = 50;
+    blocked_decode.prompt_tokens = 2;
+    blocked_decode.num_computed_tokens = 2;
+    blocked_decode.max_output_tokens = 4;
+    blocked_decode.output_tokens = {7};
+    blocked_decode.max_schedulable_tokens = 0;
+
+    funasr::UnifiedRequestProgress capped_prefill;
+    capped_prefill.request_id = 51;
+    capped_prefill.prompt_tokens = 20;
+    capped_prefill.max_output_tokens = 4;
+    capped_prefill.max_schedulable_tokens = 3;
+
+    funasr::UnifiedRequestProgress second_prefill = capped_prefill;
+    second_prefill.request_id = 52;
+
+    funasr::MixedBatchPlan plan = scheduler.build_plan(
+        {blocked_decode, capped_prefill, second_prefill});
+    TEST_ASSERT(plan.ok(), "capacity-constrained plan succeeds");
+    TEST_EQ((int)plan.sequences.size(), 1,
+            "max_num_seqs limits distinct requests");
+    if (plan.sequences.size() == 1) {
+        TEST_EQ(plan.sequences[0].request_id, 51,
+                "first runnable prefill selected");
+        TEST_EQ(plan.sequences[0].num_tokens, 3,
+                "KV capacity caps prompt chunk");
+    }
+
+    funasr::UnifiedRequestProgress invalid = capped_prefill;
+    invalid.request_id = 60;
+    invalid.prompt_tokens = -1;
+    plan = scheduler.build_plan({invalid});
+    TEST_ASSERT(plan.error == funasr::UnifiedPlanError::InvalidRequest,
+                "invalid request rejects whole plan");
+    TEST_EQ((int)plan.sequences.size(), 0,
+            "invalid plan schedules no work");
+
+    funasr::UnifiedRequestProgress duplicate = capped_prefill;
+    duplicate.request_id = 70;
+    plan = scheduler.build_plan({duplicate, duplicate});
+    TEST_ASSERT(plan.error == funasr::UnifiedPlanError::DuplicateRequestId,
+                "duplicate request id is rejected");
+
+    const funasr::UnifiedSchedulerConfig bad_config{0, 8, 8};
+    const funasr::UnifiedTokenScheduler bad_scheduler(bad_config);
+    plan = bad_scheduler.build_plan({capped_prefill});
+    TEST_ASSERT(plan.error == funasr::UnifiedPlanError::InvalidConfig,
+                "invalid scheduler config is rejected");
+
+    const funasr::UnifiedSchedulerConfig starved_decode_config{40, 32, 8};
+    const funasr::UnifiedTokenScheduler starved_decode_scheduler(
+        starved_decode_config);
+    plan = starved_decode_scheduler.build_plan({capped_prefill});
+    TEST_ASSERT(plan.error == funasr::UnifiedPlanError::InvalidConfig,
+                "token budget must cover every active decode sequence");
+
+    funasr::UnifiedRequestProgress overflowing = capped_prefill;
+    overflowing.request_id = 80;
+    overflowing.prompt_tokens = std::numeric_limits<int>::max();
+    overflowing.output_tokens = {1};
+    plan = scheduler.build_plan({overflowing});
+    TEST_ASSERT(plan.error == funasr::UnifiedPlanError::InvalidRequest,
+                "request token extent must fit the progress type");
+}
+
 int main() {
     std::printf("========================================\n");
     std::printf("Unified Scheduler Unit Tests\n");
@@ -200,6 +273,7 @@ int main() {
     test_decode_first_mixed_token_budget_plan();
     test_only_final_prefill_chunk_produces_logits();
     test_commit_prompt_then_schedule_first_decode_input();
+    test_validation_capacity_and_sequence_limit();
 
     std::printf("\n========================================\n");
     std::printf("Tests passed: %d\n", tests_passed);
