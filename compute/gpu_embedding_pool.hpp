@@ -62,7 +62,11 @@ private:
     struct Slot;
 
     bool rebuild_backing(Slot& slot, int token_count, int embedding_dim);
+    GPUEmbeddingHandle claim_slot(
+        size_t slot_index, int token_count, int embedding_dim);
     static bool valid_range(int extent, int offset, int count);
+    static bool embedding_bytes(
+        int token_count, int embedding_dim, size_t& bytes);
 
     ggml_backend_t backend_ = nullptr;
     std::vector<std::unique_ptr<Slot>> slots_;

@@ -47,8 +47,39 @@ bool GPUEmbeddingPool::valid_range(int extent, int offset, int count) {
     return end <= static_cast<int64_t>(extent);
 }
 
+bool GPUEmbeddingPool::embedding_bytes(
+        int token_count, int embedding_dim, size_t& bytes) {
+    if (token_count < 0 || embedding_dim <= 0) {
+        return false;
+    }
+
+    const uint64_t size_limit =
+        static_cast<uint64_t>(std::numeric_limits<size_t>::max());
+    const uint64_t int64_limit =
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    const uint64_t limit = size_limit < int64_limit ? size_limit : int64_limit;
+    const uint64_t tokens = static_cast<uint64_t>(token_count);
+    const uint64_t dim = static_cast<uint64_t>(embedding_dim);
+    if (tokens > limit / dim) {
+        return false;
+    }
+    const uint64_t elements = tokens * dim;
+    if (elements > limit / sizeof(float)) {
+        return false;
+    }
+    bytes = static_cast<size_t>(elements * sizeof(float));
+    return true;
+}
+
 bool GPUEmbeddingPool::rebuild_backing(
         Slot& slot, int token_count, int embedding_dim) {
+    size_t tensor_bytes = 0;
+    if (token_count <= 0 ||
+        !embedding_bytes(token_count, embedding_dim, tensor_bytes)) {
+        return false;
+    }
+    (void)tensor_bytes;
+
     const ggml_init_params params = {
         ggml_tensor_overhead() * 2,
         nullptr,
@@ -82,37 +113,55 @@ bool GPUEmbeddingPool::rebuild_backing(
     return true;
 }
 
+GPUEmbeddingHandle GPUEmbeddingPool::claim_slot(
+        size_t slot_index, int token_count, int embedding_dim) {
+    Slot& slot = *slots_[slot_index];
+    ++slot.generation;
+    if (slot.generation == 0) {
+        ++slot.generation;
+    }
+    slot.owner_token_count = token_count;
+    slot.in_use = true;
+    return {
+        static_cast<int>(slot_index),
+        slot.generation,
+        token_count,
+        embedding_dim,
+    };
+}
+
 GPUEmbeddingHandle GPUEmbeddingPool::acquire(
         int token_count, int embedding_dim) {
-    if (!backend_ || token_count <= 0 || embedding_dim <= 0) {
+    size_t tensor_bytes = 0;
+    if (!backend_ || token_count <= 0 || embedding_dim <= 0 ||
+        !embedding_bytes(token_count, embedding_dim, tensor_bytes)) {
         return {};
+    }
+    (void)tensor_bytes;
+
+    size_t best_fit = slots_.size();
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        const Slot& slot = *slots_[i];
+        if (!slot.in_use && slot.tensor &&
+            slot.embedding_dim == embedding_dim &&
+            slot.capacity_tokens >= token_count &&
+            (best_fit == slots_.size() ||
+             slot.capacity_tokens < slots_[best_fit]->capacity_tokens)) {
+            best_fit = i;
+        }
+    }
+    if (best_fit != slots_.size()) {
+        return claim_slot(best_fit, token_count, embedding_dim);
     }
 
     for (size_t i = 0; i < slots_.size(); ++i) {
         Slot& slot = *slots_[i];
-        if (slot.in_use) {
-            continue;
-        }
-
-        if (!slot.tensor || slot.embedding_dim != embedding_dim ||
-            slot.capacity_tokens < token_count) {
+        if (!slot.in_use) {
             if (!rebuild_backing(slot, token_count, embedding_dim)) {
                 return {};
             }
+            return claim_slot(i, token_count, embedding_dim);
         }
-
-        ++slot.generation;
-        if (slot.generation == 0) {
-            ++slot.generation;
-        }
-        slot.owner_token_count = token_count;
-        slot.in_use = true;
-        return {
-            static_cast<int>(i),
-            slot.generation,
-            token_count,
-            embedding_dim,
-        };
     }
     return {};
 }
@@ -172,21 +221,16 @@ bool GPUEmbeddingPool::set_host(
     }
 
     const Slot& slot = *slots_[static_cast<size_t>(handle.slot)];
-    const int64_t elements =
-        static_cast<int64_t>(token_count) * handle.embedding_dim;
-    const int64_t byte_offset =
-        static_cast<int64_t>(token_offset) * handle.embedding_dim * sizeof(float);
-    const int64_t byte_count = elements * sizeof(float);
-    if (byte_offset < 0 || byte_count <= 0 ||
-        static_cast<uint64_t>(byte_offset) >
-            std::numeric_limits<size_t>::max() ||
-        static_cast<uint64_t>(byte_count) >
-            std::numeric_limits<size_t>::max()) {
+    size_t byte_offset = 0;
+    size_t byte_count = 0;
+    if (!embedding_bytes(token_offset, handle.embedding_dim, byte_offset) ||
+        !embedding_bytes(token_count, handle.embedding_dim, byte_count) ||
+        byte_count == 0 ||
+        byte_offset > std::numeric_limits<size_t>::max() - byte_count) {
         return false;
     }
     ggml_backend_tensor_set(
-        slot.tensor, source, static_cast<size_t>(byte_offset),
-        static_cast<size_t>(byte_count));
+        slot.tensor, source, byte_offset, byte_count);
     return true;
 }
 
@@ -197,7 +241,10 @@ bool GPUEmbeddingPool::copy_tensor(
         int source_offset,
         int count) {
     if (!owns(handle) || !source || source->type != GGML_TYPE_F32 ||
+        !source->buffer || !source->data || source->ne[0] <= 0 ||
+        source->ne[1] <= 0 || source->ne[2] != 1 || source->ne[3] != 1 ||
         source->ne[0] != handle.embedding_dim ||
+        !ggml_is_contiguous(source) ||
         !valid_range(handle.token_count, destination_offset, count) ||
         source->ne[1] > std::numeric_limits<int>::max() ||
         !valid_range(static_cast<int>(source->ne[1]), source_offset, count)) {

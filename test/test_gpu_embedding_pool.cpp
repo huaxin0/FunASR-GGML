@@ -6,6 +6,7 @@
 #include <ggml.h>
 
 #include <cstdio>
+#include <climits>
 #include <vector>
 
 static int tests_passed = 0;
@@ -241,6 +242,83 @@ void test_backend_tensor_copy_with_offsets() {
     ggml_backend_free(backend);
 }
 
+void test_acquire_uses_best_fit_reusable_slot() {
+    std::printf("\n--- Test 5: Best-fit reusable slot selection ---\n");
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    {
+        funasr::GPUEmbeddingPool pool(backend, 2);
+        const auto small = pool.acquire(2, 3);
+        const auto large = pool.acquire(8, 3);
+        TEST_ASSERT(small.valid() && large.valid(),
+                    "small and large backing slots are allocated");
+        TEST_ASSERT(pool.release(small), "small slot releases");
+        TEST_ASSERT(pool.release(large), "large slot releases");
+
+        const size_t reserved_before = pool.reserved_bytes();
+        const auto medium = pool.acquire(6, 3);
+        TEST_ASSERT(medium.valid(), "medium request acquires a slot");
+        TEST_EQ(medium.slot, large.slot,
+                "medium request reuses the fitting large slot");
+        TEST_EQ(pool.reserved_bytes(), reserved_before,
+                "best-fit reuse does not allocate more backing memory");
+    }
+    ggml_backend_free(backend);
+}
+
+void test_copy_tensor_rejects_unsafe_sources() {
+    std::printf("\n--- Test 6: Unsafe tensor sources are rejected ---\n");
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    {
+        funasr::GPUEmbeddingPool pool(backend, 1);
+        const auto handle = pool.acquire(4, 3);
+
+        BackendTensor padded_base(backend, 4, 3);
+        const ggml_init_params view_params = {
+            ggml_tensor_overhead() * 2, nullptr, true};
+        ggml_context* view_ctx = ggml_init(view_params);
+        ggml_tensor* non_contiguous = ggml_view_2d(
+            view_ctx, padded_base.tensor, 3, 2,
+            padded_base.tensor->nb[1], 0);
+        TEST_ASSERT(
+            ggml_backend_view_init(non_contiguous) == GGML_STATUS_SUCCESS,
+            "non-contiguous source view is allocated");
+        TEST_ASSERT(!ggml_is_contiguous(non_contiguous),
+                    "source view is genuinely non-contiguous");
+        TEST_ASSERT(!pool.copy_tensor(
+                        handle, 0, non_contiguous, 0, 2),
+                    "non-contiguous source is rejected without asserting");
+        ggml_free(view_ctx);
+
+        const ggml_init_params source_params = {
+            ggml_tensor_overhead() * 2, nullptr, true};
+        ggml_context* source_ctx = ggml_init(source_params);
+        ggml_tensor* unallocated =
+            ggml_new_tensor_2d(source_ctx, GGML_TYPE_F32, 3, 2);
+        TEST_ASSERT(unallocated->buffer == nullptr,
+                    "source tensor has no backend allocation");
+        TEST_ASSERT(!pool.copy_tensor(handle, 0, unallocated, 0, 2),
+                    "unallocated source is rejected without asserting");
+        ggml_free(source_ctx);
+    }
+    ggml_backend_free(backend);
+}
+
+void test_extreme_shape_is_rejected_without_consuming_slot() {
+    std::printf("\n--- Test 7: Shape byte overflow is rejected ---\n");
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    {
+        funasr::GPUEmbeddingPool pool(backend, 1);
+        const int free_before = pool.free_count();
+        const auto overflow = pool.acquire(INT_MAX, INT_MAX);
+        TEST_ASSERT(!overflow.valid(), "overflowing shape is rejected");
+        TEST_EQ(pool.free_count(), free_before,
+                "overflowing shape consumes no slot");
+        TEST_EQ(pool.reserved_bytes(), 0,
+                "overflowing shape reserves no backing memory");
+    }
+    ggml_backend_free(backend);
+}
+
 }  // namespace
 
 int main() {
@@ -252,6 +330,9 @@ int main() {
     test_invalid_inputs_and_ranges();
     test_host_write_and_view();
     test_backend_tensor_copy_with_offsets();
+    test_acquire_uses_best_fit_reusable_slot();
+    test_copy_tensor_rejects_unsafe_sources();
+    test_extreme_shape_is_rejected_without_consuming_slot();
 
     std::printf("\n========================================\n");
     std::printf("Results: %d passed, %d failed\n",
