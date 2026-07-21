@@ -70,4 +70,42 @@ MixedBatchPlan UnifiedTokenScheduler::build_plan(
     return plan;
 }
 
+bool UnifiedTokenScheduler::commit_sequence(
+    UnifiedRequestProgress& request,
+    const ScheduledSequence& scheduled) {
+    if (request.finished || scheduled.request_id != request.request_id ||
+        scheduled.num_tokens <= 0 ||
+        scheduled.token_offset != request.num_computed_tokens ||
+        scheduled.num_tokens > request.available_tokens()) {
+        return false;
+    }
+
+    request.num_computed_tokens += scheduled.num_tokens;
+    return true;
+}
+
+SampleCommitResult UnifiedTokenScheduler::commit_sample(
+    UnifiedRequestProgress& request,
+    int token_id,
+    int eos_id) {
+    if (request.finished || request.max_output_tokens <= 0 ||
+        request.num_computed_tokens !=
+            request.prompt_tokens +
+                static_cast<int>(request.output_tokens.size())) {
+        return SampleCommitResult::Invalid;
+    }
+    if (token_id == eos_id) {
+        request.finished = true;
+        return SampleCommitResult::FinishedEos;
+    }
+
+    request.output_tokens.push_back(token_id);
+    if (static_cast<int>(request.output_tokens.size()) >=
+        request.max_output_tokens) {
+        request.finished = true;
+        return SampleCommitResult::FinishedLimit;
+    }
+    return SampleCommitResult::Appended;
+}
+
 } // namespace funasr

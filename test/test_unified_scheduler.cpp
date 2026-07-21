@@ -128,6 +128,70 @@ void test_only_final_prefill_chunk_produces_logits() {
     }
 }
 
+void test_commit_prompt_then_schedule_first_decode_input() {
+    std::printf("\n--- Test 3: Commit prompt and first decode input ---\n");
+
+    const funasr::UnifiedSchedulerConfig config{4, 128, 128};
+    const funasr::UnifiedTokenScheduler scheduler(config);
+
+    funasr::UnifiedRequestProgress request;
+    request.request_id = 40;
+    request.prompt_tokens = 522;
+    request.num_computed_tokens = 512;
+    request.max_output_tokens = 2;
+
+    funasr::MixedBatchPlan plan = scheduler.build_plan({request});
+    TEST_EQ((int)plan.sequences.size(), 1,
+            "final prompt sequence count before commit");
+    if (plan.sequences.size() == 1) {
+        TEST_ASSERT(funasr::UnifiedTokenScheduler::commit_sequence(
+                        request, plan.sequences[0]),
+                    "final prompt sequence commits");
+    }
+    TEST_EQ(request.num_computed_tokens, 522,
+            "prompt progress reaches end");
+
+    const funasr::SampleCommitResult first =
+        funasr::UnifiedTokenScheduler::commit_sample(request, 1234, 9999);
+    TEST_ASSERT(first == funasr::SampleCommitResult::Appended,
+                "first output token is appended");
+    TEST_EQ((int)request.output_tokens.size(), 1,
+            "one sampled token exists");
+    TEST_EQ(request.num_computed_tokens, 522,
+            "sampled token is not in KV before next iteration");
+
+    plan = scheduler.build_plan({request});
+    TEST_EQ((int)plan.sequences.size(), 1, "one decode input is scheduled");
+    if (plan.sequences.size() == 1) {
+        TEST_ASSERT(plan.sequences[0].input_kind ==
+                        funasr::UnifiedInputKind::Decode,
+                    "sampled token becomes decode input");
+        TEST_EQ(plan.sequences[0].token_offset, 522,
+                "first output token uses position 522");
+        TEST_ASSERT(funasr::UnifiedTokenScheduler::commit_sequence(
+                        request, plan.sequences[0]),
+                    "decode sequence commits");
+    }
+
+    const funasr::SampleCommitResult second =
+        funasr::UnifiedTokenScheduler::commit_sample(request, 5678, 9999);
+    TEST_ASSERT(second == funasr::SampleCommitResult::FinishedLimit,
+                "second output reaches generation limit");
+    TEST_ASSERT(request.finished, "request is finished at output limit");
+
+    funasr::UnifiedRequestProgress eos_request;
+    eos_request.request_id = 41;
+    eos_request.prompt_tokens = 1;
+    eos_request.num_computed_tokens = 1;
+    eos_request.max_output_tokens = 4;
+    const funasr::SampleCommitResult eos =
+        funasr::UnifiedTokenScheduler::commit_sample(eos_request, 99, 99);
+    TEST_ASSERT(eos == funasr::SampleCommitResult::FinishedEos,
+                "EOS finishes without appending");
+    TEST_EQ((int)eos_request.output_tokens.size(), 0,
+            "EOS is not included in output tokens");
+}
+
 int main() {
     std::printf("========================================\n");
     std::printf("Unified Scheduler Unit Tests\n");
@@ -135,6 +199,7 @@ int main() {
 
     test_decode_first_mixed_token_budget_plan();
     test_only_final_prefill_chunk_produces_logits();
+    test_commit_prompt_then_schedule_first_decode_input();
 
     std::printf("\n========================================\n");
     std::printf("Tests passed: %d\n", tests_passed);
