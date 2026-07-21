@@ -48,8 +48,8 @@ void test_decode_first_mixed_token_budget_plan() {
 
     const funasr::UnifiedTokenScheduler scheduler(config);
     const std::vector<funasr::UnifiedRequestProgress> requests = {
-        decode_request,
         prefill_request,
+        decode_request,
     };
     const funasr::MixedBatchPlan plan = scheduler.build_plan(requests);
 
@@ -64,6 +64,7 @@ void test_decode_first_mixed_token_budget_plan() {
         TEST_EQ(decode.request_id, 10, "decode request id");
         TEST_ASSERT(decode.input_kind == funasr::UnifiedInputKind::Decode,
                     "decode request input kind");
+        TEST_EQ(decode.request_index, 1, "decode request input index");
         TEST_EQ(decode.token_offset, 4, "decode token offset");
         TEST_EQ(decode.num_tokens, 1, "decode token count");
 
@@ -71,6 +72,7 @@ void test_decode_first_mixed_token_budget_plan() {
         TEST_EQ(prefill.request_id, 20, "prefill request id");
         TEST_ASSERT(prefill.input_kind == funasr::UnifiedInputKind::Prompt,
                     "prefill request input kind");
+        TEST_EQ(prefill.request_index, 0, "prefill request input index");
         TEST_EQ(prefill.token_offset, 0, "prefill token offset");
         TEST_EQ(prefill.num_tokens, 3, "prefill token count");
     }
