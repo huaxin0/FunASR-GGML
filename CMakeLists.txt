@@ -71,6 +71,7 @@ add_library(funasr_pipeline STATIC
     pipeline/audio_capture.cpp
     pipeline/chunking.cpp
     pipeline/offline_batching.cpp
+    pipeline/unified_scheduler.cpp
 )
 target_link_libraries(funasr_pipeline PUBLIC funasr_model funasr_compute)
 if(UNIX AND NOT APPLE)
@@ -135,6 +136,9 @@ if(FUNASR_BUILD_TESTS AND EXISTS "${CMAKE_SOURCE_DIR}/test/test_config.cpp")
 
     add_executable(test_offline_scheduler test/test_offline_scheduler.cpp)
     target_link_libraries(test_offline_scheduler PRIVATE funasr_pipeline)
+
+    add_executable(test_unified_scheduler test/test_unified_scheduler.cpp)
+    target_link_libraries(test_unified_scheduler PRIVATE funasr_pipeline)
 
     add_executable(test_realtime test/test_realtime.cpp)
     target_link_libraries(test_realtime PRIVATE funasr_pipeline)
