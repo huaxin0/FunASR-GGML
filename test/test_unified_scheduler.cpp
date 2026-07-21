@@ -263,6 +263,23 @@ void test_validation_capacity_and_sequence_limit() {
     plan = scheduler.build_plan({overflowing});
     TEST_ASSERT(plan.error == funasr::UnifiedPlanError::InvalidRequest,
                 "request token extent must fit the progress type");
+
+    funasr::UnifiedRequestProgress exhausted = capped_prefill;
+    exhausted.request_id = 81;
+    exhausted.num_computed_tokens = 24;
+    exhausted.output_tokens = {1, 2, 3, 4};
+    plan = scheduler.build_plan({exhausted});
+    TEST_ASSERT(plan.error == funasr::UnifiedPlanError::InvalidRequest,
+                "unfinished request cannot already be at output limit");
+
+    funasr::UnifiedRequestProgress over_limit = exhausted;
+    over_limit.request_id = 82;
+    over_limit.num_computed_tokens = 25;
+    over_limit.output_tokens.push_back(5);
+    over_limit.finished = true;
+    plan = scheduler.build_plan({over_limit});
+    TEST_ASSERT(plan.error == funasr::UnifiedPlanError::InvalidRequest,
+                "request cannot exceed output limit");
 }
 
 int main() {

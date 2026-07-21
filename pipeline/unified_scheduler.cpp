@@ -32,6 +32,12 @@ bool UnifiedRequestProgress::valid() const {
         return false;
     }
 
+    const size_t output_limit = static_cast<size_t>(max_output_tokens);
+    if (output_tokens.size() > output_limit ||
+        (!finished && output_tokens.size() == output_limit)) {
+        return false;
+    }
+
     const int64_t available_end =
         static_cast<int64_t>(prompt_tokens) +
         static_cast<int64_t>(output_tokens.size());
