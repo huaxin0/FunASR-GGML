@@ -235,6 +235,17 @@ frontend requests/step:    1
 
 这些参数用于 benchmark 调优，不作为代码中的固定假设。
 
+第一版要求：
+
+```text
+max_num_scheduled_tokens >= max_num_seqs
+```
+
+这样即使所有活跃 request 同时处于 Decode，每个 request 在一轮中仍能获得
+一个 token。每轮实际执行量可以小于预算上限；预算控制的是上限，不要求强行
+填满。若后续允许预算小于活跃 Decode 数，则必须额外实现跨 iteration 的公平
+轮转，不能始终从相同 request 开始调度。
+
 ### 7.2 单轮调度流程
 
 每个 scheduler iteration 执行：

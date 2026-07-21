@@ -640,6 +640,13 @@ void test_validation_capacity_and_sequence_limit() {
     plan = bad_scheduler.build_plan({capped_prefill});
     TEST_ASSERT(plan.error == funasr::UnifiedPlanError::InvalidConfig,
                 "invalid scheduler config is rejected");
+
+    funasr::UnifiedSchedulerConfig starved_decode_config{40, 32, 8};
+    funasr::UnifiedTokenScheduler starved_decode_scheduler(
+        starved_decode_config);
+    plan = starved_decode_scheduler.build_plan({capped_prefill});
+    TEST_ASSERT(plan.error == funasr::UnifiedPlanError::InvalidConfig,
+                "token budget must cover every active decode sequence");
 }
 ```
 
@@ -677,7 +684,8 @@ bool UnifiedRequestProgress::valid() const {
 ```cpp
     if (config_.max_num_seqs <= 0 ||
         config_.max_num_scheduled_tokens <= 0 ||
-        config_.max_prefill_chunk_tokens <= 0) {
+        config_.max_prefill_chunk_tokens <= 0 ||
+        config_.max_num_scheduled_tokens < config_.max_num_seqs) {
         plan.error = UnifiedPlanError::InvalidConfig;
         return plan;
     }
