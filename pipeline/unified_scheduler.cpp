@@ -34,7 +34,8 @@ bool UnifiedRequestProgress::valid() const {
 
     const size_t output_limit = static_cast<size_t>(max_output_tokens);
     if (output_tokens.size() > output_limit ||
-        (!finished && output_tokens.size() == output_limit)) {
+        (!finished && output_tokens.size() == output_limit) ||
+        (num_computed_tokens < prompt_tokens && !output_tokens.empty())) {
         return false;
     }
 
@@ -112,7 +113,10 @@ MixedBatchPlan UnifiedTokenScheduler::build_plan(
             request.max_schedulable_tokens <= 0) {
             continue;
         }
-        const int count = std::min({request.available_tokens(), budget,
+        const int prompt_remaining =
+            request.prompt_tokens - request.num_computed_tokens;
+        const int count = std::min({request.available_tokens(), prompt_remaining,
+                                    budget,
                                     config_.max_prefill_chunk_tokens,
                                     request.max_schedulable_tokens});
         if (count > 0) {

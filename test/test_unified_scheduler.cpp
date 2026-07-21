@@ -232,6 +232,8 @@ void test_invalid_commit_does_not_advance_request() {
     TEST_ASSERT(!funasr::UnifiedTokenScheduler::commit_sequence(
                     candidate, invalid),
                 "zero token sequence is rejected");
+    TEST_EQ(candidate.num_computed_tokens, 2,
+            "zero token sequence preserves progress");
 
     candidate = request;
     invalid = scheduled;
@@ -251,12 +253,30 @@ void test_invalid_commit_does_not_advance_request() {
             "non-runnable sequence preserves progress");
 
     candidate = request;
+    candidate.finished = true;
+    TEST_ASSERT(!funasr::UnifiedTokenScheduler::commit_sequence(
+                    candidate, scheduled),
+                "finished sequence commit is rejected");
+    TEST_EQ(candidate.num_computed_tokens, 2,
+            "finished sequence preserves progress");
+
+    candidate = request;
+    candidate.prompt_tokens = -1;
+    TEST_ASSERT(!funasr::UnifiedTokenScheduler::commit_sequence(
+                    candidate, scheduled),
+                "invalid request sequence commit is rejected");
+    TEST_EQ(candidate.num_computed_tokens, 2,
+            "invalid request preserves sequence progress");
+
+    candidate = request;
     TEST_ASSERT(funasr::UnifiedTokenScheduler::commit_sample(
                     candidate, 10, 99) ==
                     funasr::SampleCommitResult::Invalid,
                 "sample commit requires aligned computed state");
     TEST_EQ((int)candidate.output_tokens.size(), 0,
             "invalid sample does not append a token");
+    TEST_ASSERT(!candidate.finished,
+                "invalid sample does not finish request");
 
     candidate = request;
     candidate.num_computed_tokens = 4;
@@ -267,6 +287,31 @@ void test_invalid_commit_does_not_advance_request() {
                 "non-runnable sample commit is rejected");
     TEST_EQ((int)candidate.output_tokens.size(), 0,
             "non-runnable sample does not append a token");
+    TEST_ASSERT(!candidate.finished,
+                "non-runnable sample does not finish request");
+
+    candidate = request;
+    candidate.num_computed_tokens = 4;
+    candidate.finished = true;
+    TEST_ASSERT(funasr::UnifiedTokenScheduler::commit_sample(
+                    candidate, 10, 99) ==
+                    funasr::SampleCommitResult::Invalid,
+                "finished sample commit is rejected");
+    TEST_EQ((int)candidate.output_tokens.size(), 0,
+            "finished sample does not append a token");
+    TEST_ASSERT(candidate.finished,
+                "invalid operation preserves finished state");
+
+    candidate = request;
+    candidate.prompt_tokens = -1;
+    TEST_ASSERT(funasr::UnifiedTokenScheduler::commit_sample(
+                    candidate, 10, 99) ==
+                    funasr::SampleCommitResult::Invalid,
+                "invalid request sample commit is rejected");
+    TEST_EQ((int)candidate.output_tokens.size(), 0,
+            "invalid request sample does not append a token");
+    TEST_ASSERT(!candidate.finished,
+                "invalid request sample preserves finished state");
 }
 
 void test_validation_capacity_and_sequence_limit() {
@@ -303,6 +348,32 @@ void test_validation_capacity_and_sequence_limit() {
         TEST_EQ(plan.sequences[0].num_tokens, 3,
                 "KV capacity caps prompt chunk");
     }
+
+    funasr::UnifiedRequestProgress final_prefill;
+    final_prefill.request_id = 53;
+    final_prefill.prompt_tokens = 10;
+    final_prefill.num_computed_tokens = 9;
+    final_prefill.max_output_tokens = 4;
+    final_prefill.max_schedulable_tokens = 8;
+    plan = scheduler.build_plan({final_prefill});
+    TEST_ASSERT(plan.ok(), "legal final prefill plan succeeds");
+    TEST_EQ((int)plan.sequences.size(), 1,
+            "legal final prefill schedules one sequence");
+    if (plan.sequences.size() == 1) {
+        TEST_EQ(plan.sequences[0].num_tokens, 1,
+                "final prefill cannot cross prompt boundary");
+        TEST_ASSERT(plan.sequences[0].produces_logits,
+                    "final prompt token produces logits");
+    }
+
+    funasr::UnifiedRequestProgress premature_output = final_prefill;
+    premature_output.request_id = 54;
+    premature_output.output_tokens = {7};
+    plan = scheduler.build_plan({premature_output});
+    TEST_ASSERT(plan.error == funasr::UnifiedPlanError::InvalidRequest,
+                "output token before prompt completion is invalid");
+    TEST_EQ((int)plan.sequences.size(), 0,
+            "invalid prompt/output state schedules no work");
 
     funasr::UnifiedRequestProgress invalid = capped_prefill;
     invalid.request_id = 60;
