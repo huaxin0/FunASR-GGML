@@ -2,9 +2,31 @@
 
 #include <ggml-alloc.h>
 
+#include <atomic>
 #include <limits>
+#include <stdexcept>
 
 namespace funasr {
+
+namespace {
+
+uint64_t next_pool_epoch() {
+    static std::atomic<uint64_t> next{1};
+    uint64_t epoch = next.load(std::memory_order_relaxed);
+    for (;;) {
+        if (epoch == std::numeric_limits<uint64_t>::max()) {
+            throw std::overflow_error("GPU embedding pool epoch exhausted");
+        }
+        if (next.compare_exchange_weak(
+                epoch, epoch + 1,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return epoch;
+        }
+    }
+}
+
+}  // namespace
 
 struct GPUEmbeddingPool::Slot {
     ggml_context* ctx = nullptr;
@@ -27,7 +49,7 @@ struct GPUEmbeddingPool::Slot {
 };
 
 GPUEmbeddingPool::GPUEmbeddingPool(ggml_backend_t backend, int max_slots)
-    : backend_(backend) {
+    : backend_(backend), pool_epoch_(next_pool_epoch()) {
     if (max_slots <= 0) {
         return;
     }
@@ -125,6 +147,7 @@ GPUEmbeddingHandle GPUEmbeddingPool::claim_slot(
     return {
         static_cast<int>(slot_index),
         slot.generation,
+        pool_epoch_,
         token_count,
         embedding_dim,
     };
@@ -132,6 +155,7 @@ GPUEmbeddingHandle GPUEmbeddingPool::claim_slot(
 
 GPUEmbeddingHandle GPUEmbeddingPool::acquire(
         int token_count, int embedding_dim) {
+    const std::lock_guard<std::mutex> lock(mutex_);
     size_t tensor_bytes = 0;
     if (!backend_ || token_count <= 0 || embedding_dim <= 0 ||
         !embedding_bytes(token_count, embedding_dim, tensor_bytes)) {
@@ -166,8 +190,10 @@ GPUEmbeddingHandle GPUEmbeddingPool::acquire(
     return {};
 }
 
-bool GPUEmbeddingPool::owns(const GPUEmbeddingHandle& handle) const {
-    if (!handle.valid() || handle.slot >= static_cast<int>(slots_.size())) {
+bool GPUEmbeddingPool::owns_unlocked(
+        const GPUEmbeddingHandle& handle) const {
+    if (!handle.valid() || handle.pool_epoch != pool_epoch_ ||
+        handle.slot >= static_cast<int>(slots_.size())) {
         return false;
     }
     const Slot& slot = *slots_[static_cast<size_t>(handle.slot)];
@@ -176,8 +202,14 @@ bool GPUEmbeddingPool::owns(const GPUEmbeddingHandle& handle) const {
            slot.embedding_dim == handle.embedding_dim;
 }
 
+bool GPUEmbeddingPool::owns(const GPUEmbeddingHandle& handle) const {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return owns_unlocked(handle);
+}
+
 bool GPUEmbeddingPool::release(const GPUEmbeddingHandle& handle) {
-    if (!owns(handle)) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (!owns_unlocked(handle)) {
         return false;
     }
     Slot& slot = *slots_[static_cast<size_t>(handle.slot)];
@@ -186,7 +218,27 @@ bool GPUEmbeddingPool::release(const GPUEmbeddingHandle& handle) {
     return true;
 }
 
+bool GPUEmbeddingPool::reserve_slots(int min_capacity) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (min_capacity <= static_cast<int>(slots_.size())) {
+        return true;
+    }
+    if (min_capacity <= 0) {
+        return false;
+    }
+    try {
+        slots_.reserve(static_cast<size_t>(min_capacity));
+        while (static_cast<int>(slots_.size()) < min_capacity) {
+            slots_.push_back(std::make_unique<Slot>());
+        }
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
 int GPUEmbeddingPool::free_count() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
     int count = 0;
     for (const auto& slot : slots_) {
         if (!slot->in_use) {
@@ -197,10 +249,12 @@ int GPUEmbeddingPool::free_count() const {
 }
 
 int GPUEmbeddingPool::capacity() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
     return static_cast<int>(slots_.size());
 }
 
 size_t GPUEmbeddingPool::reserved_bytes() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
     size_t bytes = 0;
     for (const auto& slot : slots_) {
         if (slot->buffer) {
@@ -215,7 +269,8 @@ bool GPUEmbeddingPool::set_host(
         int token_offset,
         const float* source,
         int token_count) {
-    if (!owns(handle) || !source ||
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (!owns_unlocked(handle) || !source ||
         !valid_range(handle.token_count, token_offset, token_count)) {
         return false;
     }
@@ -240,7 +295,8 @@ bool GPUEmbeddingPool::copy_tensor(
         ggml_tensor* source,
         int source_offset,
         int count) {
-    if (!owns(handle) || !source || source->type != GGML_TYPE_F32 ||
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (!owns_unlocked(handle) || !source || source->type != GGML_TYPE_F32 ||
         !source->buffer || !source->data || source->ne[0] <= 0 ||
         source->ne[1] <= 0 || source->ne[2] != 1 || source->ne[3] != 1 ||
         source->ne[0] != handle.embedding_dim ||
@@ -280,7 +336,8 @@ ggml_tensor* GPUEmbeddingPool::view(
         const GPUEmbeddingHandle& handle,
         int offset,
         int count) const {
-    if (!ctx || !owns(handle) ||
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (!ctx || !owns_unlocked(handle) ||
         !valid_range(handle.token_count, offset, count)) {
         return nullptr;
     }

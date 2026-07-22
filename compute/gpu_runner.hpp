@@ -161,6 +161,66 @@ public:
                                   block_table, block_size, logits_out);
     }
 
+    bool copy_paged_kv_block_rows(
+        int source_block,
+        int destination_block,
+        int valid_rows,
+        int block_size
+    ) {
+        const auto& cache = gpu_ctx_.kv_cache();
+        if (!cache.initialized || source_block < 0 || destination_block < 0 ||
+            source_block == destination_block || valid_rows <= 0 ||
+            block_size <= 0 || valid_rows >= block_size) {
+            return false;
+        }
+
+        const int block_capacity = cache.physical_rows / block_size;
+        if (source_block >= block_capacity || destination_block >= block_capacity) {
+            return false;
+        }
+
+        const size_t row_size = ggml_row_size(cache.k->type, cache.kv_dim);
+        const size_t metadata_size = ggml_tensor_overhead() *
+            static_cast<size_t>(cache.n_layers * 4 + 4);
+        ggml_init_params params = {metadata_size, nullptr, true};
+        ggml_context* ctx = ggml_init(params);
+        if (!ctx) {
+            return false;
+        }
+
+        const int source_row = source_block * block_size;
+        const int destination_row = destination_block * block_size;
+        for (int layer = 0; layer < cache.n_layers; layer++) {
+            const size_t layer_offset = static_cast<size_t>(layer) *
+                                        cache.physical_rows * row_size;
+            const size_t source_offset = layer_offset +
+                static_cast<size_t>(source_row) * row_size;
+            const size_t destination_offset = layer_offset +
+                static_cast<size_t>(destination_row) * row_size;
+
+            ggml_tensor* k_source = ggml_view_2d(
+                ctx, cache.k, cache.kv_dim, valid_rows, row_size, source_offset);
+            ggml_tensor* k_destination = ggml_view_2d(
+                ctx, cache.k, cache.kv_dim, valid_rows, row_size, destination_offset);
+            ggml_tensor* v_source = ggml_view_2d(
+                ctx, cache.v, cache.kv_dim, valid_rows, row_size, source_offset);
+            ggml_tensor* v_destination = ggml_view_2d(
+                ctx, cache.v, cache.kv_dim, valid_rows, row_size, destination_offset);
+
+            if (ggml_backend_view_init(k_source) != GGML_STATUS_SUCCESS ||
+                ggml_backend_view_init(k_destination) != GGML_STATUS_SUCCESS ||
+                ggml_backend_view_init(v_source) != GGML_STATUS_SUCCESS ||
+                ggml_backend_view_init(v_destination) != GGML_STATUS_SUCCESS) {
+                ggml_free(ctx);
+                return false;
+            }
+            ggml_backend_tensor_copy(k_source, k_destination);
+            ggml_backend_tensor_copy(v_source, v_destination);
+        }
+        ggml_free(ctx);
+        return true;
+    }
+
     bool forward_batch_decode_slots(
         const std::vector<const float*>& input_embeds,
         const std::vector<int>& n_pasts,

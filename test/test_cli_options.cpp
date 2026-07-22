@@ -39,6 +39,16 @@ bool test_offline_flags_parse() {
         arg((char*)"--kv-mode"), arg((char*)"paged"),
         arg((char*)"--kv-block-size"), arg((char*)"128"),
         arg((char*)"--kv-num-blocks"), arg((char*)"384"),
+        arg((char*)"--unified-scheduler"), arg((char*)"on"),
+        arg((char*)"--max-scheduled-tokens"), arg((char*)"768"),
+        arg((char*)"--max-prefill-chunk-tokens"), arg((char*)"192"),
+        arg((char*)"--max-frontend-requests"), arg((char*)"3"),
+        arg((char*)"--frontend-batching"), arg((char*)"off"),
+        arg((char*)"--frontend-prefetch"), arg((char*)"off"),
+        arg((char*)"--gpu-frontend-overlap"), arg((char*)"on"),
+        arg((char*)"--frontend-bucket-window"), arg((char*)"24"),
+        arg((char*)"--mixed-graph-cache-entries"), arg((char*)"12"),
+        arg((char*)"--offline-auto-tune"), arg((char*)"on"),
     }, opt);
 
     TEST_ASSERT(ok, "offline flags parse successfully");
@@ -48,6 +58,22 @@ bool test_offline_flags_parse() {
     TEST_ASSERT(opt.offline_kv_mode == OfflineKVMode::Paged, "paged kv mode parsed");
     TEST_ASSERT(opt.offline_kv_block_size == 128, "kv block size parsed");
     TEST_ASSERT(opt.offline_kv_num_blocks == 384, "kv block count parsed");
+    TEST_ASSERT(opt.unified_scheduler, "unified scheduler parsed");
+    TEST_ASSERT(opt.max_scheduled_tokens == 768,
+                "scheduled token budget parsed");
+    TEST_ASSERT(opt.max_prefill_chunk_tokens == 192,
+                "prefill chunk budget parsed");
+    TEST_ASSERT(opt.max_frontend_requests_per_step == 3,
+                "frontend request budget parsed");
+    TEST_ASSERT(!opt.frontend_batching, "frontend batching flag parsed");
+    TEST_ASSERT(!opt.frontend_prefetch, "frontend prefetch flag parsed");
+    TEST_ASSERT(opt.gpu_frontend_overlap,
+                "GPU frontend overlap flag parsed");
+    TEST_ASSERT(opt.frontend_bucket_window == 24,
+                "frontend bucket window parsed");
+    TEST_ASSERT(opt.mixed_graph_cache_entries == 12,
+                "mixed graph cache capacity parsed");
+    TEST_ASSERT(opt.offline_auto_tune, "offline auto tune parsed");
     return true;
 }
 
@@ -65,13 +91,61 @@ bool test_long_video_preset() {
     TEST_ASSERT(ok, "long-video preset parses");
     TEST_ASSERT(opt.offline_scheduler, "preset enables offline scheduler");
     TEST_ASSERT(opt.offline_profile, "preset enables offline profile");
-    TEST_ASSERT(opt.offline_batch_size == 12, "preset batch size is 12");
+    TEST_ASSERT(opt.offline_batch_size == 40, "preset batch size is 40");
     TEST_ASSERT(opt.offline_kv_mode == OfflineKVMode::Paged, "preset uses paged kv");
     TEST_ASSERT(opt.offline_kv_block_size == 128, "preset block size is 128");
     TEST_ASSERT(opt.ctx_size == 4096, "preset ctx size is 4096");
     TEST_ASSERT(opt.chunk_mode == ChunkMode::Window, "preset uses window chunks");
     TEST_ASSERT(opt.chunk_sec == 30, "preset chunk size is 30 seconds");
     TEST_ASSERT(opt.max_tokens == 220, "preset max tokens is 220");
+    TEST_ASSERT(opt.offline_kv_num_blocks == 192,
+                "preset uses measured physical KV pool");
+    TEST_ASSERT(opt.prefix_kv_cache,
+                "preset enables task prefix KV reuse");
+    TEST_ASSERT(opt.dynamic_kv_blocks, "preset enables dynamic KV blocks");
+    TEST_ASSERT(opt.unified_scheduler,
+                "preset enables unified scheduler");
+    TEST_ASSERT(opt.max_frontend_requests_per_step == 4,
+                "preset keeps tuned frontend budget");
+    TEST_ASSERT(opt.frontend_batching,
+                "preset enables batched frontend by default");
+    TEST_ASSERT(opt.frontend_prefetch,
+                "preset enables Fbank prefetch");
+    TEST_ASSERT(!opt.gpu_frontend_overlap,
+                "preset keeps contending GPU overlap disabled");
+    TEST_ASSERT(opt.frontend_bucket_window == 32,
+                "preset enables bounded length bucketing");
+    TEST_ASSERT(opt.mixed_graph_cache_entries == 16,
+                "preset enables multi-entry mixed graph cache");
+    TEST_ASSERT(opt.offline_auto_tune,
+                "preset enables memory-aware auto tuning");
+    return true;
+}
+
+bool test_long_video_legacy_preset() {
+    std::printf("\n--- CLI long-video legacy preset ---\n");
+    Options opt;
+    const bool ok = parse_with_args({
+        arg((char*)"funasr-cli"),
+        arg((char*)"-m"), arg((char*)"FunAsr_q8.bin"),
+        arg((char*)"-f"), arg((char*)"video.wav"),
+        arg((char*)"--offline-preset"), arg((char*)"long-video-legacy"),
+    }, opt);
+    TEST_ASSERT(ok, "legacy preset parses");
+    TEST_ASSERT(opt.offline_batch_size == 12,
+                "legacy preset keeps batch 12");
+    TEST_ASSERT(!opt.unified_scheduler,
+                "legacy preset keeps old scheduler");
+    TEST_ASSERT(!opt.prefix_kv_cache,
+                "legacy preset keeps prefix reuse off");
+    TEST_ASSERT(!opt.frontend_prefetch,
+                "legacy preset keeps frontend prefetch off");
+    TEST_ASSERT(!opt.gpu_frontend_overlap,
+                "legacy preset keeps GPU overlap off");
+    TEST_ASSERT(opt.mixed_graph_cache_entries == 1,
+                "legacy preset keeps single graph entry");
+    TEST_ASSERT(!opt.offline_auto_tune,
+                "legacy preset keeps auto tune off");
     return true;
 }
 
@@ -140,6 +214,17 @@ bool test_make_offline_batch_config() {
     opt.offline_kv_mode = OfflineKVMode::Paged;
     opt.offline_kv_block_size = 96;
     opt.offline_kv_num_blocks = 128;
+    opt.prefix_kv_cache = true;
+    opt.dynamic_kv_blocks = true;
+    opt.unified_scheduler = true;
+    opt.max_scheduled_tokens = 640;
+    opt.max_prefill_chunk_tokens = 160;
+    opt.max_frontend_requests_per_step = 2;
+    opt.frontend_batching = false;
+    opt.frontend_prefetch = false;
+    opt.gpu_frontend_overlap = true;
+    opt.frontend_bucket_window = 20;
+    opt.mixed_graph_cache_entries = 6;
 
     funasr::OfflineBatchConfig cfg = make_offline_batch_config(opt);
 
@@ -152,10 +237,33 @@ bool test_make_offline_batch_config() {
     TEST_ASSERT(cfg.use_paged_kv, "paged kv mode mapped");
     TEST_ASSERT(cfg.kv_block_size == 96, "kv block size mapped");
     TEST_ASSERT(cfg.kv_num_blocks == 128, "kv block count mapped");
+    TEST_ASSERT(cfg.enable_prefix_kv_cache, "prefix KV cache mapped");
+    TEST_ASSERT(cfg.enable_dynamic_kv_blocks, "dynamic KV blocks mapped");
+    TEST_ASSERT(cfg.use_unified_scheduler, "unified scheduler mapped");
+    TEST_ASSERT(cfg.max_num_scheduled_tokens == 640,
+                "scheduled token budget mapped");
+    TEST_ASSERT(cfg.max_prefill_chunk_tokens == 160,
+                "prefill chunk budget mapped");
+    TEST_ASSERT(cfg.max_frontend_requests_per_step == 2,
+                "frontend request budget mapped");
+    TEST_ASSERT(!cfg.enable_frontend_batching,
+                "frontend batching flag mapped");
+    TEST_ASSERT(!cfg.enable_frontend_prefetch,
+                "frontend prefetch flag mapped");
+    TEST_ASSERT(cfg.enable_gpu_frontend_overlap,
+                "GPU frontend overlap flag mapped");
+    TEST_ASSERT(cfg.frontend_bucket_window == 20,
+                "frontend bucket window mapped");
+    TEST_ASSERT(cfg.mixed_graph_cache_entries == 6,
+                "mixed graph cache capacity mapped");
 
     opt.offline_kv_mode = OfflineKVMode::Continuous;
     cfg = make_offline_batch_config(opt);
     TEST_ASSERT(!cfg.use_paged_kv, "continuous kv mode mapped");
+    TEST_ASSERT(!cfg.enable_prefix_kv_cache,
+                "continuous mode disables prefix KV cache");
+    TEST_ASSERT(!cfg.enable_dynamic_kv_blocks,
+                "continuous mode disables dynamic KV blocks");
     return true;
 }
 
@@ -179,6 +287,46 @@ bool test_gpu_init_slots() {
     opt.offline_batch_size = 0;
     TEST_ASSERT(gpu_init_slots(opt) == 1,
                 "gpu init slot count is clamped positive");
+    return true;
+}
+
+bool test_gpu_init_physical_kv_rows() {
+    std::printf("\n--- CLI GPU physical KV rows ---\n");
+    Options opt;
+    opt.use_gpu = true;
+    opt.offline_scheduler = true;
+    opt.chunk_mode = ChunkMode::Window;
+    opt.offline_kv_mode = OfflineKVMode::Paged;
+    opt.offline_batch_size = 32;
+    opt.ctx_size = 4096;
+    opt.offline_kv_block_size = 128;
+    opt.offline_kv_num_blocks = 160;
+
+    TEST_ASSERT(gpu_init_physical_kv_rows(opt) == 20480,
+                "paged init uses explicit global pool");
+
+    opt.offline_kv_mode = OfflineKVMode::Continuous;
+    TEST_ASSERT(gpu_init_physical_kv_rows(opt) == 0,
+                "continuous init preserves default allocation");
+    return true;
+}
+
+bool test_gpu_init_prompt_slots() {
+    std::printf("\n--- CLI GPU prompt slots ---\n");
+    Options opt;
+    opt.use_gpu = true;
+    opt.offline_batch_size = 12;
+    opt.max_frontend_requests_per_step = 4;
+
+    TEST_ASSERT(gpu_init_prompt_slots(opt) == 1,
+                "ordinary GPU mode keeps one prompt slot");
+    opt.offline_scheduler = true;
+    opt.chunk_mode = ChunkMode::Window;
+    TEST_ASSERT(gpu_init_prompt_slots(opt) == 12,
+                "legacy offline scheduler matches active slots");
+    opt.unified_scheduler = true;
+    TEST_ASSERT(gpu_init_prompt_slots(opt) == 16,
+                "unified scheduler reserves a prepared frontend group");
     return true;
 }
 
@@ -218,19 +366,54 @@ bool test_offline_paged_opts_parse_disable() {
     return true;
 }
 
+bool test_prefix_cache_and_dynamic_block_flags() {
+    std::printf("\n--- CLI prefix cache and dynamic block flags ---\n");
+    Options opt;
+    TEST_ASSERT(!opt.prefix_kv_cache, "prefix KV cache disabled by default");
+    TEST_ASSERT(!opt.dynamic_kv_blocks, "dynamic KV blocks disabled by default");
+
+    bool ok = parse_with_args({
+        arg((char*)"funasr-cli"),
+        arg((char*)"-m"), arg((char*)"FunAsr_q8.bin"),
+        arg((char*)"-f"), arg((char*)"video.wav"),
+        arg((char*)"--prefix-kv-cache"), arg((char*)"on"),
+        arg((char*)"--dynamic-kv-blocks"), arg((char*)"on"),
+    }, opt);
+    TEST_ASSERT(ok, "runtime KV flags parse");
+    TEST_ASSERT(opt.prefix_kv_cache, "prefix KV cache enabled explicitly");
+    TEST_ASSERT(opt.dynamic_kv_blocks, "dynamic KV blocks enabled explicitly");
+
+    ok = parse_with_args({
+        arg((char*)"funasr-cli"),
+        arg((char*)"-m"), arg((char*)"FunAsr_q8.bin"),
+        arg((char*)"-f"), arg((char*)"video.wav"),
+        arg((char*)"--offline-preset"), arg((char*)"long-video"),
+        arg((char*)"--prefix-kv-cache"), arg((char*)"off"),
+        arg((char*)"--dynamic-kv-blocks"), arg((char*)"off"),
+    }, opt);
+    TEST_ASSERT(ok, "runtime KV flags override preset");
+    TEST_ASSERT(!opt.prefix_kv_cache, "prefix KV cache can be disabled");
+    TEST_ASSERT(!opt.dynamic_kv_blocks, "dynamic KV blocks can be disabled");
+    return true;
+}
+
 } // namespace
 
 int main() {
     int failed = 0;
     if (!test_offline_flags_parse()) failed++;
     if (!test_long_video_preset()) failed++;
+    if (!test_long_video_legacy_preset()) failed++;
     if (!test_preset_can_be_overridden_afterwards()) failed++;
     if (!test_invalid_kv_mode_fails()) failed++;
     if (!test_offline_routing_requires_chunks()) failed++;
     if (!test_make_offline_batch_config()) failed++;
     if (!test_gpu_init_slots()) failed++;
+    if (!test_gpu_init_physical_kv_rows()) failed++;
+    if (!test_gpu_init_prompt_slots()) failed++;
     if (!test_offline_paged_opts_default_and_disable()) failed++;
     if (!test_offline_paged_opts_parse_disable()) failed++;
+    if (!test_prefix_cache_and_dynamic_block_flags()) failed++;
 
     if (failed == 0) {
         std::printf("\nAll CLI option tests passed!\n");

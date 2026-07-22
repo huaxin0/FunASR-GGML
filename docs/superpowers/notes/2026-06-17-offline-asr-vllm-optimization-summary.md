@@ -536,3 +536,117 @@ move from scheduler optimization to kernel optimization
 
 这条路线也和真实推理系统优化很接近：前期靠调度和内存组织拿大收益，后期进入
 kernel 和硬件效率阶段，优化难度变高，但技术含金量也更高。
+
+## 2026-07-17：动态 Paged KV 分配与任务级 Prefix KV 实验
+
+这一轮重新审视了两个不合理点：
+
+```text
+admit 时用 seconds * 25 + 128 + max_tokens 预留全部 KV block
+每个 chunk 都重新计算完全相同的 ChatML prefix
+```
+
+原实现对 30 秒 chunk 通常固定分配 9 个 128-token block，但实际 prefill 是 522
+token，decode 通常结束在 80-120 token 左右。完整 204-chunk 测量显示：
+
+```text
+alloc_blocks=1836
+used_blocks=1024
+wasted_blocks=812
+waste_rate=44.23%
+blocks_peak=108/384
+```
+
+### 动态 block 实现
+
+新的动态路径改为：
+
+```text
+frontend 先得到真实 audio_frames
+按 prefix + audio_frames + suffix 精确分配 prefill blocks
+decode 写入 n_past 前检查是否跨 block 边界
+只有跨边界时 append 一个新 block
+request 完成后逐块归还
+```
+
+`PagedKVBlockPool` 同时增加了 refcount、重复释放检测、原子 append 和 COW
+ownership transfer。完整 204-chunk 结果：
+
+```text
+ok=204/204
+wall=57.679s
+blocks_peak=61/384
+alloc_blocks=1024
+used_blocks=1024
+wasted_blocks=0
+waste_rate=0.00%
+prefill_appends=1019
+decode_appends=5
+ownership_errors=0
+final_free=384/384
+```
+
+因此，这一轮确定性的收益是 KV 逻辑块峰值从 108 降到 61，消除了 44.23% 的
+整块过量预留。wall 落在既有约 55-59 秒波动区间，当前只能判断性能基本持平，
+不能宣称完整 workload 加速。
+
+这也修正了短 benchmark 的统计问题：使用 `--max-chunks` 后，RTF 和
+`audio_sec/s` 必须按选中的 chunk 音频时长计算，不能继续使用完整源文件时长。
+
+### Prefix KV cache 与 partial-block COW
+
+任务级 prefix cache 实现了以下完整生命周期：
+
+```text
+固定 ChatML prefix 只做一次 paged prefill
+cache handle 持有一个 block reference
+request attach 时 retain
+prefix 最后一个 block 未对齐时先做 GPU D2D COW
+tail 仅 prefill [audio embeddings + suffix]
+request 与 task cache 分别 release
+```
+
+当前默认 prompt 的 prefix 只有 18 token，因此它全部落在一个 partial block 中。
+每个 request 在追加 audio KV 前都必须复制 28 层的 K/V 有效行。功能验证结果是：
+
+```text
+prefix_builds=1
+prefix_hits=24
+cow_copies=24
+ownership_errors=0
+final_free=384/384
+```
+
+但 24-chunk 四象限实验表明，prefix cache 当前不适合作为默认性能优化：
+
+```text
+variant                 wall_ms  peak_blocks  waste_rate
+static_no_cache             7842      108/384      44.44%
+dynamic_no_cache            6717       60/384       0.00%
+static_prefix_cache         6959      109/384      44.44%
+dynamic_prefix_cache        6995       61/384       0.00%
+```
+
+cache-on 与 cache-off 在 24 个 chunk 中有 6 个出现单字或标点级差异，例如
+“倍后/背后”“他/它”。这是 full prefill 与 split prefill 使用不同 GPU shape 后的
+浮点数值路径差异，不是 block ownership 或 COW 数据损坏：cache-on 两组输出一致，
+cache-off 两组输出一致，长度也保持一致。
+
+综合判断：
+
+```text
+dynamic KV blocks: long-video preset 默认开启
+prefix KV cache:   保留 --prefix-kv-cache on 实验开关，默认关闭
+```
+
+这个负结果同样重要。prefix caching 不是看到固定 prompt 就一定有收益；收益取决于
+prefix 长度、可共享的完整 block 数量、COW 成本和 split-prefill 的数值稳定性。当前
+18-token prefix 太短，COW 的逐层同步成本抵消了省下的计算。后续若要继续，应先把
+多层 K/V copy 合成单个 CUDA graph/kernel，或者在更长 hotword/system prompt 上
+重新评估。
+
+四象限测试脚本：
+
+```bash
+tools/bench_prefix_kv_dynamic_blocks.sh --max-chunks 24 --repeat 1
+```

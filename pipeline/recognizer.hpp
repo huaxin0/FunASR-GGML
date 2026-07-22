@@ -73,12 +73,16 @@ public:
     // ============================================================
     // GPU 初始化（可选，在 init() 之后调用）
     // ============================================================
-    bool init_gpu(int n_ctx = 2048, int gpu_id = 0, int n_slots = 1) {
+    bool init_gpu(int n_ctx = 2048, int gpu_id = 0, int n_slots = 1,
+                  int physical_kv_rows = 0, int prompt_slots = 0,
+                  bool enable_frontend_overlap = false) {
         if (!ready_ || !pipeline_) {
             last_error_ = "Call init() before init_gpu()";
             return false;
         }
-        if (!pipeline_->init_gpu(n_ctx, gpu_id, n_slots)) {
+        if (!pipeline_->init_gpu(
+                n_ctx, gpu_id, n_slots, physical_kv_rows, prompt_slots,
+                enable_frontend_overlap)) {
             last_error_ = "Failed to init GPU";
             return false;
         }
@@ -87,6 +91,10 @@ public:
 
     bool is_gpu_ready() const {
         return pipeline_ && pipeline_->is_gpu_ready();
+    }
+
+    bool configure_mixed_graph_cache(int capacity) {
+        return pipeline_ && pipeline_->configure_mixed_graph_cache(capacity);
     }
 
     // ============================================================
@@ -197,6 +205,169 @@ public:
             audio, request_id, block_table, block_size, config);
     }
 
+    PreparedGPUAudio prepare_audio_gpu(
+        const AudioSpan& audio,
+        int request_id
+    ) {
+        if (!ready_) {
+            last_error_ = "Not initialized";
+            return {};
+        }
+        return pipeline_->prepare_audio_gpu(audio, request_id);
+    }
+
+    PreparedGPUPrompt prepare_prompt_gpu(
+        AudioSpan audio,
+        int request_id,
+        int cached_prefix_tokens,
+        const InferenceConfig& config = InferenceConfig()
+    ) {
+        if (!ready_) {
+            last_error_ = "Not initialized";
+            return {};
+        }
+        return pipeline_->prepare_prompt_gpu(
+            audio, request_id, cached_prefix_tokens, config);
+    }
+
+    std::vector<PreparedGPUPrompt> prepare_prompts_gpu_batch(
+        const std::vector<AudioSpan>& audio,
+        const std::vector<int>& request_ids,
+        int cached_prefix_tokens,
+        const InferenceConfig& config = InferenceConfig()
+    ) {
+        if (!ready_) {
+            last_error_ = "Not initialized";
+            return {};
+        }
+        return pipeline_->prepare_prompts_gpu_batch(
+            audio, request_ids, cached_prefix_tokens, config);
+    }
+
+    PreparedFbankBatch prepare_fbank_batch(
+        const std::vector<AudioSpan>& audio,
+        const std::vector<int>& request_ids,
+        int n_threads
+    ) {
+        if (!ready_) {
+            last_error_ = "Not initialized";
+            return {};
+        }
+        return pipeline_->prepare_fbank_batch(
+            audio, request_ids, n_threads);
+    }
+
+    std::vector<PreparedGPUPrompt> prepare_prompts_gpu_batch_from_fbank(
+        const PreparedFbankBatch& fbank_batch,
+        int cached_prefix_tokens,
+        const InferenceConfig& config = InferenceConfig()
+    ) {
+        if (!ready_) {
+            last_error_ = "Not initialized";
+            return {};
+        }
+        return pipeline_->prepare_prompts_gpu_batch_from_fbank(
+            fbank_batch, cached_prefix_tokens, config);
+    }
+
+    bool release_prompt_gpu(const GPUEmbeddingHandle& handle) {
+        return ready_ && pipeline_->release_prompt_gpu(handle);
+    }
+
+    bool reserve_prompt_embedding_slots(int min_capacity) {
+        return ready_ &&
+               pipeline_->reserve_prompt_embedding_slots(min_capacity);
+    }
+
+    int free_prompt_embedding_slots() const {
+        return ready_ ? pipeline_->free_prompt_embedding_slots() : 0;
+    }
+
+    int prompt_embedding_capacity() const {
+        return ready_ ? pipeline_->prompt_embedding_capacity() : 0;
+    }
+
+    bool supports_gpu_frontend_overlap() const {
+        return ready_ && pipeline_->supports_gpu_frontend_overlap();
+    }
+
+    void synchronize_gpu_frontend() {
+        if (ready_) {
+            pipeline_->synchronize_gpu_frontend();
+        }
+    }
+
+    GPUMixedStepResult gpu_mixed_step_paged(
+        const std::vector<GPUMixedStepInput>& inputs,
+        int block_size,
+        const InferenceConfig& config = InferenceConfig()
+    ) {
+        if (!ready_) {
+            last_error_ = "Not initialized";
+            return {};
+        }
+        return pipeline_->gpu_mixed_step_paged(inputs, block_size, config);
+    }
+
+    GPUPrefillState gpu_prefill_prompt_chunk_paged(
+        const PreparedGPUPrompt& prepared,
+        int absolute_token_offset,
+        int requested_tokens,
+        const std::vector<int>& block_table,
+        int block_size,
+        const InferenceConfig& config = InferenceConfig()
+    ) {
+        if (!ready_) {
+            last_error_ = "Not initialized";
+            return {};
+        }
+        return pipeline_->gpu_prefill_prompt_chunk_paged(
+            prepared, absolute_token_offset, requested_tokens,
+            block_table, block_size, config);
+    }
+
+    GPUPrefillState gpu_prefill_prefix_paged(
+        const std::vector<int>& prefix_ids,
+        int request_id,
+        const std::vector<int>& block_table,
+        int block_size,
+        const InferenceConfig& config = InferenceConfig()
+    ) {
+        if (!ready_) {
+            last_error_ = "Not initialized";
+            return {};
+        }
+        return pipeline_->gpu_prefill_prefix_paged(
+            prefix_ids, request_id, block_table, block_size, config);
+    }
+
+    GPUPrefillState gpu_prefill_prepared_audio_paged(
+        const PreparedGPUAudio& prepared,
+        int request_id,
+        const std::vector<int>& block_table,
+        int block_size,
+        int cached_prefix_tokens,
+        const InferenceConfig& config = InferenceConfig()
+    ) {
+        if (!ready_) {
+            last_error_ = "Not initialized";
+            return {};
+        }
+        return pipeline_->gpu_prefill_prepared_audio_paged(
+            prepared, request_id, block_table, block_size,
+            cached_prefix_tokens, config);
+    }
+
+    bool copy_paged_kv_block_rows(
+        int source_block,
+        int destination_block,
+        int valid_rows,
+        int block_size
+    ) {
+        return ready_ && pipeline_->copy_paged_kv_block_rows(
+            source_block, destination_block, valid_rows, block_size);
+    }
+
     std::vector<GPUDecodeStepOutput> gpu_decode_step_slots(
         const std::vector<GPUDecodeStepInput>& inputs,
         const InferenceConfig& config = InferenceConfig(),
@@ -214,6 +385,14 @@ public:
             return PagedDecodeProfile{};
         }
         return pipeline_->gpu_paged_decode_profile();
+    }
+
+    std::vector<int> prompt_prefix_ids(const PromptOptions& options) const {
+        return ready_ ? pipeline_->prompt_prefix_ids(options) : std::vector<int>{};
+    }
+
+    std::vector<int> prompt_suffix_ids(const PromptOptions& options) const {
+        return ready_ ? pipeline_->prompt_suffix_ids(options) : std::vector<int>{};
     }
 
     // ============================================================

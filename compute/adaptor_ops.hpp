@@ -46,6 +46,17 @@ ggml_tensor* adaptor_forward(
     const AdaptorConfig& cfg
 );
 
+// Batched GPU frontend path. The attention mask isolates padded frames for
+// each sequence; all token-wise linear/normalization operations share the
+// explicit batch dimension.
+ggml_tensor* adaptor_forward_batched(
+    ggml_context* ctx,
+    ggml_tensor* x,
+    ggml_tensor* attention_mask,
+    const AdaptorWeights& weights,
+    const AdaptorConfig& cfg
+);
+
 } // namespace funasr
 
 #endif // FUNASR_COMPUTE_ADAPTOR_OPS_HPP

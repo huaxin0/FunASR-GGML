@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace funasr {
@@ -14,12 +15,13 @@ namespace funasr {
 struct GPUEmbeddingHandle {
     int slot = -1;
     uint64_t generation = 0;
+    uint64_t pool_epoch = 0;
     int token_count = 0;
     int embedding_dim = 0;
 
     bool valid() const {
-        return slot >= 0 && generation != 0 && token_count > 0 &&
-               embedding_dim > 0;
+        return slot >= 0 && generation != 0 && pool_epoch != 0 &&
+               token_count > 0 && embedding_dim > 0;
     }
 };
 
@@ -34,6 +36,7 @@ public:
     GPUEmbeddingHandle acquire(int token_count, int embedding_dim);
     bool owns(const GPUEmbeddingHandle& handle) const;
     bool release(const GPUEmbeddingHandle& handle);
+    bool reserve_slots(int min_capacity);
 
     int free_count() const;
     int capacity() const;
@@ -62,6 +65,7 @@ private:
     struct Slot;
 
     bool rebuild_backing(Slot& slot, int token_count, int embedding_dim);
+    bool owns_unlocked(const GPUEmbeddingHandle& handle) const;
     GPUEmbeddingHandle claim_slot(
         size_t slot_index, int token_count, int embedding_dim);
     static bool valid_range(int extent, int offset, int count);
@@ -69,6 +73,8 @@ private:
         int token_count, int embedding_dim, size_t& bytes);
 
     ggml_backend_t backend_ = nullptr;
+    uint64_t pool_epoch_ = 0;
+    mutable std::mutex mutex_;
     std::vector<std::unique_ptr<Slot>> slots_;
 };
 

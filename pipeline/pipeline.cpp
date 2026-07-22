@@ -11,11 +11,16 @@
 #include "compute/llm_ops.hpp"
 #include "compute/graph_runner.hpp"
 #include <ggml.h>
+#ifdef FUNASR_USE_CUDA
+#include <ggml-cuda.h>
+#endif
 #include <algorithm>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <future>
+#include <limits>
 #include <memory>
 #include <utility>
 
@@ -82,6 +87,32 @@ struct GgmlContextDeleter {
 
 using PipelineGgmlContextPtr = std::unique_ptr<ggml_context, GgmlContextDeleter>;
 
+#ifdef FUNASR_USE_CUDA
+class GPUEmbeddingReleaseGuard {
+public:
+    GPUEmbeddingReleaseGuard(
+            GPUEmbeddingPool* pool, const GPUEmbeddingHandle& handle)
+        : pool_(pool), handle_(handle) {}
+
+    ~GPUEmbeddingReleaseGuard() {
+        if (active_ && pool_) {
+            pool_->release(handle_);
+        }
+    }
+
+    GPUEmbeddingReleaseGuard(const GPUEmbeddingReleaseGuard&) = delete;
+    GPUEmbeddingReleaseGuard& operator=(
+        const GPUEmbeddingReleaseGuard&) = delete;
+
+    void dismiss() { active_ = false; }
+
+private:
+    GPUEmbeddingPool* pool_ = nullptr;
+    GPUEmbeddingHandle handle_;
+    bool active_ = true;
+};
+#endif
+
 void add_gpu_dither(std::vector<float>& samples, uint32_t seed) {
     constexpr float amplitude = 0.0005f;
     uint32_t state = seed ? seed : 1u;
@@ -116,6 +147,13 @@ Pipeline::Pipeline(FunASRModel& model, Tokenizer& tokenizer)
 Pipeline::~Pipeline() {
 #ifdef FUNASR_USE_CUDA
     free_prefill_staging();
+    gpu_mixed_runner_.reset();
+    gpu_prompt_pool_.reset();
+    gpu_ea_runner_.reset();
+    if (gpu_frontend_backend_) {
+        ggml_backend_free(gpu_frontend_backend_);
+        gpu_frontend_backend_ = nullptr;
+    }
 #endif
 }
 
@@ -134,10 +172,31 @@ int Pipeline::argmax(const float* logits, int vocab_size) {
 // ============================================================
 // GPU 初始化
 // ============================================================
-bool Pipeline::init_gpu(int n_ctx, int gpu_id, int n_slots) {
+bool Pipeline::init_gpu(
+    int n_ctx,
+    int gpu_id,
+    int n_slots,
+    int physical_kv_rows,
+    int prompt_slots,
+    bool enable_frontend_overlap) {
 #ifdef FUNASR_USE_CUDA
+    // init_gpu may be called again. Release every object backed by the old
+    // backend before replacing GPUContext.
+    free_prefill_staging();
+    gpu_mixed_runner_.reset();
+    gpu_prompt_pool_.reset();
+    gpu_ea_runner_.reset();
+    if (gpu_frontend_backend_) {
+        ggml_backend_free(gpu_frontend_backend_);
+        gpu_frontend_backend_ = nullptr;
+    }
+    gpu_runner_.reset();
+    gpu_ctx_.reset();
+
     gpu_ctx_ = std::make_unique<GPUContext>();
-    if (!gpu_ctx_->init(model_.llm, model_.config.llm, n_ctx, gpu_id, n_slots)) {
+    if (!gpu_ctx_->init(
+            model_.llm, model_.config.llm, n_ctx, gpu_id, n_slots,
+            physical_kv_rows)) {
         gpu_ctx_.reset();
         return false;
     }
@@ -152,7 +211,19 @@ bool Pipeline::init_gpu(int n_ctx, int gpu_id, int n_slots) {
         printf("[Pipeline] WARNING: GPU warmup failed\n");
     }
 
-    gpu_ea_runner_ = std::make_unique<GPUEncoderAdaptorRunner>(gpu_ctx_->backend());
+    gpu_frontend_backend_ = enable_frontend_overlap
+        ? ggml_backend_cuda_init(gpu_id)
+        : nullptr;
+    ggml_backend_t frontend_backend = gpu_frontend_backend_
+        ? gpu_frontend_backend_
+        : gpu_ctx_->backend();
+    if (gpu_frontend_backend_) {
+        printf("[Pipeline] GPU frontend uses a dedicated CUDA stream\n");
+    } else if (enable_frontend_overlap) {
+        printf("[Pipeline] WARNING: dedicated GPU frontend stream unavailable\n");
+    }
+
+    gpu_ea_runner_ = std::make_unique<GPUEncoderAdaptorRunner>(frontend_backend);
     if (!gpu_ea_runner_->init(
             model_.encoder, model_.adaptor,
             model_.config.encoder, model_.config.adaptor)) {
@@ -164,9 +235,16 @@ bool Pipeline::init_gpu(int n_ctx, int gpu_id, int n_slots) {
         printf("[Pipeline] GPU encoder/adaptor ready\n");
     }
 
+    gpu_prompt_pool_ = std::make_unique<GPUEmbeddingPool>(
+        frontend_backend,
+        std::max(1, prompt_slots > 0 ? prompt_slots : n_slots));
+    gpu_mixed_runner_ = std::make_unique<GPUMixedRunner>(
+        gpu_ctx_->backend(), model_.config.llm.embedding_length);
+
     return true;
 #else
-    (void)n_ctx; (void)gpu_id;
+    (void)n_ctx; (void)gpu_id; (void)n_slots; (void)physical_kv_rows;
+    (void)prompt_slots; (void)enable_frontend_overlap;
     printf("[Pipeline] CUDA not compiled\n");
     return false;
 #endif
@@ -1365,26 +1443,20 @@ GPUPrefillState Pipeline::gpu_prefill_audio_slot(
     return state;
 }
 
-GPUPrefillState Pipeline::gpu_prefill_audio_paged(
+PreparedGPUAudio Pipeline::prepare_audio_gpu(
     const AudioSpan& audio,
-    int request_id,
-    const std::vector<int>& block_table,
-    int block_size,
-    const InferenceConfig& config
+    int request_id
 ) {
-    GPUPrefillState state;
-    state.request_id = request_id;
-    state.slot_id = -1;
-    state.block_table = block_table;
-    state.block_size = block_size;
+    PreparedGPUAudio prepared;
+    prepared.request_id = request_id;
 
 #ifdef FUNASR_USE_CUDA
-    if (!config.use_gpu || !is_gpu_ready()) {
-        printf("[Pipeline] ERROR: gpu_prefill_audio_paged requires initialized GPU\n");
-        return state;
+    if (!is_gpu_ready()) {
+        printf("[Pipeline] ERROR: prepare_audio_gpu requires initialized GPU\n");
+        return prepared;
     }
     if (!audio.data || audio.n_samples == 0) {
-        return state;
+        return prepared;
     }
 
     FbankProcessor fbank(model_.config.frontend);
@@ -1397,7 +1469,7 @@ GPUPrefillState Pipeline::gpu_prefill_audio_paged(
     int D = 0;
     if (!fbank.process(audio_for_fbank, audio.n_samples, fbank_data, T, D)) {
         printf("[Pipeline] ERROR: fbank failed for paged request %d\n", request_id);
-        return state;
+        return prepared;
     }
 
     int audio_frames = 0;
@@ -1409,25 +1481,841 @@ GPUPrefillState Pipeline::gpu_prefill_audio_paged(
     }
     if (!gpu_adaptor_tensor || audio_frames <= 0) {
         printf("[Pipeline] ERROR: GPU frontend failed for paged request %d\n", request_id);
-        return state;
+        return prepared;
     }
 
-    state.stats.encoder_ms = static_cast<float>(frontend_ms);
-    printf("[Pipeline] Scheduler frontend ran on GPU (paged): req=%d blocks=%zu %d frames -> %d embeddings in %ld ms\n",
-           request_id, block_table.size(), T, audio_frames, frontend_ms);
-
-    if (!gpu_prefill_paged(gpu_adaptor_tensor, audio_frames, nullptr,
-                           block_table, block_size, config,
-                           state.logits, state.stats)) {
-        return state;
-    }
-
-    state.n_past = state.stats.prefill_tokens;
-    state.ok = true;
+    prepared.adaptor_tensor = gpu_adaptor_tensor;
+    prepared.audio_frames = audio_frames;
+    prepared.encoder_ms = static_cast<float>(frontend_ms);
+    prepared.ok = true;
+    printf("[Pipeline] Scheduler frontend prepared on GPU: req=%d %d frames -> %d embeddings in %ld ms\n",
+           request_id, T, audio_frames, frontend_ms);
 #else
-    (void)audio; (void)request_id; (void)block_table; (void)block_size; (void)config;
+    (void)audio; (void)request_id;
     printf("[Pipeline] CUDA not compiled\n");
 #endif
+    return prepared;
+}
+
+PreparedGPUPrompt Pipeline::prepare_prompt_gpu(
+    AudioSpan audio,
+    int request_id,
+    int cached_prefix_tokens,
+    const InferenceConfig& config
+) {
+    PreparedGPUPrompt result;
+    result.request_id = request_id;
+
+#ifdef FUNASR_USE_CUDA
+    if (!config.use_gpu || !is_gpu_ready() || !gpu_prompt_pool_ ||
+        !audio.data || audio.n_samples == 0) {
+        return result;
+    }
+
+    const std::vector<int> prefix_ids =
+        prompt_builder_.prefix_ids(config.prompt);
+    const std::vector<int> suffix_ids =
+        prompt_builder_.suffix_ids(config.prompt);
+    if (prefix_ids.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        suffix_ids.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return result;
+    }
+    const int prefix_tokens = static_cast<int>(prefix_ids.size());
+    const int suffix_tokens = static_cast<int>(suffix_ids.size());
+    if (cached_prefix_tokens < 0 ||
+        (cached_prefix_tokens != 0 &&
+         cached_prefix_tokens != prefix_tokens)) {
+        return result;
+    }
+
+    // The adaptor tensor is non-owning staging memory. No frontend invocation
+    // may occur before it is copied into the owning prompt pool below.
+    const PreparedGPUAudio prepared = prepare_audio_gpu(audio, request_id);
+    if (!prepared.ok || !prepared.adaptor_tensor) {
+        return result;
+    }
+
+    const GPUPromptLayout layout = make_gpu_prompt_layout(
+        prefix_tokens, cached_prefix_tokens,
+        prepared.audio_frames, suffix_tokens);
+    const int embed_dim = model_.config.llm.embedding_length;
+    if (!layout.valid || embed_dim <= 0) {
+        return result;
+    }
+
+    const GPUEmbeddingHandle handle =
+        gpu_prompt_pool_->acquire(layout.stored_tokens, embed_dim);
+    if (!handle.valid()) {
+        return result;
+    }
+    GPUEmbeddingReleaseGuard release_guard(gpu_prompt_pool_.get(), handle);
+
+    if (!gpu_prompt_pool_->copy_tensor(
+            handle, layout.stored_prefix_tokens,
+            prepared.adaptor_tensor, 0, prepared.audio_frames)) {
+        return result;
+    }
+
+    if (layout.stored_prefix_tokens > 0) {
+        std::vector<float> prefix_embeds(
+            static_cast<size_t>(layout.stored_prefix_tokens) * embed_dim);
+        for (int i = 0; i < layout.stored_prefix_tokens; ++i) {
+            PromptBuilder::get_token_embedding(
+                model_.llm.embed_tokens, prefix_ids[static_cast<size_t>(i)],
+                prefix_embeds.data() + static_cast<size_t>(i) * embed_dim,
+                embed_dim);
+        }
+        if (!gpu_prompt_pool_->set_host(
+                handle, 0, prefix_embeds.data(),
+                layout.stored_prefix_tokens)) {
+            return result;
+        }
+    }
+
+    if (layout.suffix_tokens > 0) {
+        std::vector<float> suffix_embeds(
+            static_cast<size_t>(layout.suffix_tokens) * embed_dim);
+        for (int i = 0; i < layout.suffix_tokens; ++i) {
+            PromptBuilder::get_token_embedding(
+                model_.llm.embed_tokens, suffix_ids[static_cast<size_t>(i)],
+                suffix_embeds.data() + static_cast<size_t>(i) * embed_dim,
+                embed_dim);
+        }
+        const int suffix_offset =
+            layout.stored_prefix_tokens + layout.audio_tokens;
+        if (!gpu_prompt_pool_->set_host(
+                handle, suffix_offset, suffix_embeds.data(),
+                layout.suffix_tokens)) {
+            return result;
+        }
+    }
+
+    result.embeddings = handle;
+    result.prompt_tokens = layout.prompt_tokens;
+    result.cached_prefix_tokens = layout.cached_prefix_tokens;
+    result.audio_frames = prepared.audio_frames;
+    result.encoder_ms = prepared.encoder_ms;
+    result.ok = true;
+    release_guard.dismiss();
+#else
+    (void)audio;
+    (void)cached_prefix_tokens;
+    (void)config;
+#endif
+    return result;
+}
+
+PreparedFbankBatch Pipeline::prepare_fbank_batch(
+    const std::vector<AudioSpan>& audio,
+    const std::vector<int>& request_ids,
+    int n_threads
+) {
+    PreparedFbankBatch batch;
+    batch.audio = audio;
+    batch.request_ids = request_ids;
+    batch.items.resize(audio.size());
+    if (audio.empty() || audio.size() != request_ids.size()) {
+        return batch;
+    }
+
+    const auto fbank_begin = std::chrono::high_resolution_clock::now();
+    const size_t worker_limit = std::min(
+        audio.size(), static_cast<size_t>(std::max(1, n_threads)));
+    for (size_t base = 0; base < audio.size(); base += worker_limit) {
+        const size_t wave_size = std::min(worker_limit, audio.size() - base);
+        std::vector<std::future<FbankBatchItem>> fbank_tasks;
+        fbank_tasks.reserve(wave_size);
+        for (size_t offset = 0; offset < wave_size; ++offset) {
+            const AudioSpan span = audio[base + offset];
+            fbank_tasks.push_back(std::async(
+                std::launch::async, [this, span]() {
+                FbankBatchItem item;
+                if (!span.data || span.n_samples == 0) {
+                    return item;
+                }
+                FbankProcessor fbank(model_.config.frontend);
+                std::vector<float> scratch;
+                const float* source = prepare_audio_for_fbank(
+                    span.data, span.n_samples, true, scratch);
+                item.ok = fbank.process(
+                    source, span.n_samples,
+                    item.data, item.frames, item.dim) &&
+                    item.frames > 0 && item.dim > 0;
+                return item;
+            }));
+        }
+        for (size_t offset = 0; offset < fbank_tasks.size(); ++offset) {
+            const size_t index = base + offset;
+            try {
+                batch.items[index] = fbank_tasks[offset].get();
+            } catch (const std::exception& error) {
+                printf("[Pipeline] WARNING: batched Fbank request %zu failed: %s\n",
+                       index, error.what());
+            } catch (...) {
+                printf("[Pipeline] WARNING: batched Fbank request %zu failed\n",
+                       index);
+            }
+        }
+    }
+    const auto fbank_end = std::chrono::high_resolution_clock::now();
+    batch.fbank_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        fbank_end - fbank_begin).count();
+
+    int max_frames = 0;
+    int valid_items = 0;
+    for (const FbankBatchItem& item : batch.items) {
+        if (!item.ok) {
+            continue;
+        }
+        ++valid_items;
+        max_frames = std::max(max_frames, item.frames);
+        batch.input_frames += item.frames;
+    }
+    batch.padded_frames = static_cast<long long>(max_frames) * valid_items -
+                          batch.input_frames;
+    batch.ok = valid_items > 0;
+    return batch;
+}
+
+std::vector<PreparedGPUPrompt> Pipeline::prepare_prompts_gpu_batch(
+    const std::vector<AudioSpan>& audio,
+    const std::vector<int>& request_ids,
+    int cached_prefix_tokens,
+    const InferenceConfig& config
+) {
+    if (audio.size() == 1 && request_ids.size() == 1) {
+        return {prepare_prompt_gpu(
+            audio[0], request_ids[0], cached_prefix_tokens, config)};
+    }
+    const PreparedFbankBatch fbank_batch = prepare_fbank_batch(
+        audio, request_ids, config.n_threads);
+    return prepare_prompts_gpu_batch_from_fbank(
+        fbank_batch, cached_prefix_tokens, config);
+}
+
+std::vector<PreparedGPUPrompt> Pipeline::prepare_prompts_gpu_batch_from_fbank(
+    const PreparedFbankBatch& fbank_batch,
+    int cached_prefix_tokens,
+    const InferenceConfig& config
+) {
+    const std::vector<AudioSpan>& audio = fbank_batch.audio;
+    const std::vector<int>& request_ids = fbank_batch.request_ids;
+    std::vector<PreparedGPUPrompt> results(audio.size());
+    for (size_t i = 0; i < results.size(); ++i) {
+        results[i].request_id = i < request_ids.size()
+            ? request_ids[i]
+            : -1;
+    }
+
+#ifdef FUNASR_USE_CUDA
+    if (audio.empty() || audio.size() != request_ids.size() ||
+        !config.use_gpu || !is_gpu_ready() || !gpu_prompt_pool_ ||
+        !gpu_ea_runner_ || !gpu_ea_runner_->is_initialized()) {
+        return results;
+    }
+    const std::vector<int> prefix_ids =
+        prompt_builder_.prefix_ids(config.prompt);
+    const std::vector<int> suffix_ids =
+        prompt_builder_.suffix_ids(config.prompt);
+    if (prefix_ids.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        suffix_ids.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return results;
+    }
+    const int prefix_tokens = static_cast<int>(prefix_ids.size());
+    const int suffix_tokens = static_cast<int>(suffix_ids.size());
+    if (cached_prefix_tokens < 0 ||
+        (cached_prefix_tokens != 0 &&
+         cached_prefix_tokens != prefix_tokens)) {
+        return results;
+    }
+
+    const std::vector<FbankBatchItem>& fbank_storage = fbank_batch.items;
+    const long fbank_ms = fbank_batch.fbank_ms;
+
+    std::vector<const float*> fbank_pointers;
+    std::vector<int> fbank_frames;
+    std::vector<size_t> batch_to_result;
+    fbank_pointers.reserve(audio.size());
+    fbank_frames.reserve(audio.size());
+    batch_to_result.reserve(audio.size());
+    int fbank_dim = 0;
+
+    for (size_t i = 0; i < audio.size(); ++i) {
+        const FbankBatchItem& item = fbank_storage[i];
+        if (!item.ok || (fbank_dim != 0 && item.dim != fbank_dim)) {
+            continue;
+        }
+        fbank_dim = item.dim;
+        fbank_pointers.push_back(item.data.data());
+        fbank_frames.push_back(item.frames);
+        batch_to_result.push_back(i);
+    }
+
+    if (batch_to_result.size() < 2) {
+        for (size_t index : batch_to_result) {
+            results[index] = prepare_prompt_gpu(
+                audio[index], request_ids[index],
+                cached_prefix_tokens, config);
+        }
+        return results;
+    }
+
+    std::vector<int> output_frames;
+    int output_stride_frames = 0;
+    long frontend_ms = 0;
+    ggml_tensor* batched_adaptor = gpu_ea_runner_->forward_batch_on_gpu(
+        fbank_pointers, fbank_dim, fbank_frames,
+        output_frames, output_stride_frames, frontend_ms);
+    if (!batched_adaptor ||
+        output_frames.size() != batch_to_result.size() ||
+        output_stride_frames <= 0) {
+        printf("[Pipeline] WARNING: batched GPU frontend failed, "
+               "falling back to single requests\n");
+        for (size_t index : batch_to_result) {
+            results[index] = prepare_prompt_gpu(
+                audio[index], request_ids[index],
+                cached_prefix_tokens, config);
+        }
+        return results;
+    }
+
+    const int embed_dim = model_.config.llm.embedding_length;
+    std::vector<float> stored_prefix_embeds;
+    if (cached_prefix_tokens == 0 && prefix_tokens > 0) {
+        stored_prefix_embeds.resize(
+            static_cast<size_t>(prefix_tokens) * embed_dim);
+        for (int i = 0; i < prefix_tokens; ++i) {
+            PromptBuilder::get_token_embedding(
+                model_.llm.embed_tokens, prefix_ids[static_cast<size_t>(i)],
+                stored_prefix_embeds.data() + static_cast<size_t>(i) * embed_dim,
+                embed_dim);
+        }
+    }
+    std::vector<float> suffix_embeds(
+        static_cast<size_t>(suffix_tokens) * embed_dim);
+    for (int i = 0; i < suffix_tokens; ++i) {
+        PromptBuilder::get_token_embedding(
+            model_.llm.embed_tokens, suffix_ids[static_cast<size_t>(i)],
+            suffix_embeds.data() + static_cast<size_t>(i) * embed_dim,
+            embed_dim);
+    }
+
+    const ggml_init_params view_params = {
+        ggml_tensor_overhead() * (batch_to_result.size() + 2),
+        nullptr,
+        true,
+    };
+    PipelineGgmlContextPtr view_ctx(ggml_init(view_params));
+    if (!view_ctx) {
+        for (size_t index : batch_to_result) {
+            results[index] = prepare_prompt_gpu(
+                audio[index], request_ids[index],
+                cached_prefix_tokens, config);
+        }
+        return results;
+    }
+
+    std::vector<GPUEmbeddingHandle> acquired;
+    acquired.reserve(batch_to_result.size());
+    bool batch_copy_failed = false;
+    for (size_t b = 0; b < batch_to_result.size(); ++b) {
+        const size_t result_index = batch_to_result[b];
+        const int audio_frames = output_frames[b];
+        const GPUPromptLayout layout = make_gpu_prompt_layout(
+            prefix_tokens, cached_prefix_tokens,
+            audio_frames, suffix_tokens);
+        if (!layout.valid || audio_frames <= 0 ||
+            audio_frames > output_stride_frames) {
+            batch_copy_failed = true;
+            break;
+        }
+
+        const GPUEmbeddingHandle handle =
+            gpu_prompt_pool_->acquire(layout.stored_tokens, embed_dim);
+        if (!handle.valid()) {
+            batch_copy_failed = true;
+            break;
+        }
+        acquired.push_back(handle);
+
+        ggml_tensor* sequence_view = ggml_view_2d(
+            view_ctx.get(), batched_adaptor,
+            embed_dim, audio_frames, batched_adaptor->nb[1],
+            b * batched_adaptor->nb[2]);
+        if (!sequence_view ||
+            ggml_backend_view_init(sequence_view) != GGML_STATUS_SUCCESS ||
+            !gpu_prompt_pool_->copy_tensor(
+                handle, layout.stored_prefix_tokens,
+                sequence_view, 0, audio_frames) ||
+            (layout.stored_prefix_tokens > 0 &&
+             !gpu_prompt_pool_->set_host(
+                 handle, 0, stored_prefix_embeds.data(),
+                 layout.stored_prefix_tokens)) ||
+            (layout.suffix_tokens > 0 &&
+             !gpu_prompt_pool_->set_host(
+                 handle,
+                 layout.stored_prefix_tokens + layout.audio_tokens,
+                 suffix_embeds.data(), layout.suffix_tokens))) {
+            batch_copy_failed = true;
+            break;
+        }
+
+        PreparedGPUPrompt prepared;
+        prepared.embeddings = handle;
+        prepared.request_id = request_ids[result_index];
+        prepared.prompt_tokens = layout.prompt_tokens;
+        prepared.cached_prefix_tokens = layout.cached_prefix_tokens;
+        prepared.audio_frames = audio_frames;
+        prepared.encoder_ms = static_cast<float>(frontend_ms);
+        prepared.frontend_batch_size = static_cast<int>(
+            batch_to_result.size());
+        prepared.ok = true;
+        results[result_index] = prepared;
+    }
+
+    if (batch_copy_failed) {
+        for (const GPUEmbeddingHandle& handle : acquired) {
+            gpu_prompt_pool_->release(handle);
+        }
+        for (size_t index : batch_to_result) {
+            results[index] = prepare_prompt_gpu(
+                audio[index], request_ids[index],
+                cached_prefix_tokens, config);
+        }
+        return results;
+    }
+
+    printf("[Pipeline] Batched frontend prepared: batch=%zu max_frames=%d "
+           "fbank=%ldms gpu=%ldms total=%ldms\n",
+           batch_to_result.size(), output_stride_frames,
+           fbank_ms, frontend_ms, fbank_ms + frontend_ms);
+#else
+    (void)cached_prefix_tokens;
+    (void)config;
+#endif
+    return results;
+}
+
+bool Pipeline::release_prompt_gpu(const GPUEmbeddingHandle& handle) {
+#ifdef FUNASR_USE_CUDA
+    return gpu_prompt_pool_ && gpu_prompt_pool_->release(handle);
+#else
+    (void)handle;
+    return false;
+#endif
+}
+
+bool Pipeline::reserve_prompt_embedding_slots(int min_capacity) {
+#ifdef FUNASR_USE_CUDA
+    return gpu_prompt_pool_ &&
+           gpu_prompt_pool_->reserve_slots(min_capacity);
+#else
+    (void)min_capacity;
+    return false;
+#endif
+}
+
+int Pipeline::free_prompt_embedding_slots() const {
+#ifdef FUNASR_USE_CUDA
+    return gpu_prompt_pool_ ? gpu_prompt_pool_->free_count() : 0;
+#else
+    return 0;
+#endif
+}
+
+int Pipeline::prompt_embedding_capacity() const {
+#ifdef FUNASR_USE_CUDA
+    return gpu_prompt_pool_ ? gpu_prompt_pool_->capacity() : 0;
+#else
+    return 0;
+#endif
+}
+
+bool Pipeline::supports_gpu_frontend_overlap() const {
+#ifdef FUNASR_USE_CUDA
+    return gpu_frontend_backend_ && gpu_ea_runner_ && gpu_prompt_pool_;
+#else
+    return false;
+#endif
+}
+
+void Pipeline::synchronize_gpu_frontend() {
+#ifdef FUNASR_USE_CUDA
+    if (gpu_frontend_backend_) {
+        ggml_backend_synchronize(gpu_frontend_backend_);
+    }
+#endif
+}
+
+bool Pipeline::configure_mixed_graph_cache(int capacity) {
+#ifdef FUNASR_USE_CUDA
+    if (!gpu_mixed_runner_ || capacity <= 0) {
+        return false;
+    }
+    gpu_mixed_runner_->set_graph_cache_capacity(capacity);
+    return true;
+#else
+    (void)capacity;
+    return false;
+#endif
+}
+
+GPUMixedStepResult Pipeline::gpu_mixed_step_paged(
+    const std::vector<GPUMixedStepInput>& inputs,
+    int block_size,
+    const InferenceConfig& config
+) {
+    GPUMixedStepResult result;
+#ifdef FUNASR_USE_CUDA
+    if (!config.use_gpu || !is_gpu_ready() || !gpu_prompt_pool_ ||
+        !gpu_mixed_runner_ || inputs.empty() || block_size <= 0) {
+        return result;
+    }
+
+    std::vector<PackedSequenceSource> sources;
+    sources.reserve(inputs.size());
+    for (const auto& input : inputs) {
+        sources.push_back(input.source);
+    }
+    PackedMixedMetadata metadata =
+        build_packed_mixed_metadata(sources, block_size);
+    if (!metadata.valid) {
+        return result;
+    }
+
+    std::vector<PackedPromptSlice> prompt_slices;
+    std::vector<int> decode_token_ids;
+    std::vector<int> output_request_ids;
+    prompt_slices.reserve(inputs.size());
+    decode_token_ids.reserve(static_cast<size_t>(metadata.decode_tokens));
+    output_request_ids.reserve(metadata.selected_rows.size());
+
+    int packed_row = 0;
+    for (const auto& packed_source : metadata.sequences) {
+        const auto input_it = std::find_if(
+            inputs.begin(), inputs.end(), [&](const GPUMixedStepInput& input) {
+                return input.source.scheduled.request_id ==
+                       packed_source.scheduled.request_id;
+            });
+        if (input_it == inputs.end()) {
+            return result;
+        }
+
+        const ScheduledSequence& scheduled = packed_source.scheduled;
+        if (scheduled.input_kind == UnifiedInputKind::Prompt) {
+            const int64_t local_offset =
+                static_cast<int64_t>(scheduled.token_offset) -
+                packed_source.cached_prefix_tokens;
+            if (local_offset < 0 || local_offset >
+                    std::numeric_limits<int>::max() ||
+                !gpu_prompt_pool_->owns(input_it->prompt_embeddings)) {
+                return result;
+            }
+            prompt_slices.push_back(PackedPromptSlice{
+                input_it->prompt_embeddings,
+                static_cast<int>(local_offset),
+                scheduled.num_tokens,
+                packed_row,
+            });
+        } else {
+            decode_token_ids.push_back(packed_source.decode_token_id);
+        }
+        if (scheduled.produces_logits) {
+            output_request_ids.push_back(scheduled.request_id);
+        }
+        packed_row += scheduled.num_tokens;
+    }
+    if (packed_row != metadata.total_tokens ||
+        output_request_ids.size() != metadata.selected_rows.size()) {
+        return result;
+    }
+
+    const auto staging_begin = std::chrono::high_resolution_clock::now();
+    if (!gpu_mixed_runner_->stage_inputs(
+            *gpu_prompt_pool_, prompt_slices, metadata.prefill_tokens,
+            decode_token_ids)) {
+        return result;
+    }
+    const auto staging_end = std::chrono::high_resolution_clock::now();
+
+    std::vector<int> next_tokens;
+    MixedGraphExecutionInfo graph_info;
+    if (!gpu_mixed_runner_->execute_paged(
+            *gpu_ctx_, metadata, block_size, next_tokens,
+            &graph_info) ||
+        next_tokens.size() != output_request_ids.size()) {
+        return result;
+    }
+    const auto compute_end = std::chrono::high_resolution_clock::now();
+
+    result.outputs.reserve(next_tokens.size());
+    for (size_t i = 0; i < next_tokens.size(); ++i) {
+        result.outputs.push_back(
+            GPUMixedStepOutput{output_request_ids[i], next_tokens[i]});
+    }
+    result.total_tokens = metadata.total_tokens;
+    result.prefill_tokens = metadata.prefill_tokens;
+    result.decode_tokens = metadata.decode_tokens;
+    result.staging_ms = std::chrono::duration<float, std::milli>(
+        staging_end - staging_begin).count();
+    result.compute_ms = std::chrono::duration<float, std::milli>(
+        compute_end - staging_end).count();
+    result.graph_cache_hit = graph_info.cache_hit;
+    result.graph_shape_hash = graph_info.shape_hash;
+    result.graph_max_blocks = graph_info.max_blocks;
+    result.graph_max_n_kv = graph_info.max_n_kv;
+    result.graph_prefill_sequences = graph_info.prefill_sequences;
+    result.graph_cache_entries = graph_info.cache_entries;
+    result.graph_cache_capacity = graph_info.cache_capacity;
+    result.graph_cache_evictions = graph_info.cache_evictions;
+    result.ok = true;
+#else
+    (void)inputs;
+    (void)block_size;
+    (void)config;
+#endif
+    return result;
+}
+
+GPUPrefillState Pipeline::gpu_prefill_prompt_chunk_paged(
+    const PreparedGPUPrompt& prepared,
+    int absolute_token_offset,
+    int requested_tokens,
+    const std::vector<int>& block_table,
+    int block_size,
+    const InferenceConfig& config
+) {
+    GPUPrefillState state;
+    state.request_id = prepared.request_id;
+    state.block_table = block_table;
+    state.block_size = block_size;
+    state.stats.encoder_ms = prepared.encoder_ms;
+
+#ifdef FUNASR_USE_CUDA
+    if (!config.use_gpu || !is_gpu_ready() || !gpu_prompt_pool_ ||
+        !gpu_prompt_pool_->owns(prepared.embeddings) ||
+        block_table.empty() || block_size <= 0) {
+        return state;
+    }
+
+    const GPUPromptChunkRange range = make_gpu_prompt_chunk_range(
+        prepared, absolute_token_offset, requested_tokens);
+    if (!range.valid) {
+        return state;
+    }
+
+    const int64_t absolute_end =
+        static_cast<int64_t>(range.absolute_offset) + range.token_count;
+    if (absolute_end > std::numeric_limits<int>::max() ||
+        !check_context_capacity(static_cast<int>(absolute_end), config)) {
+        return state;
+    }
+
+    const size_t metadata_size = ggml_tensor_overhead() * 2;
+    const ggml_init_params params = {metadata_size, nullptr, true};
+    PipelineGgmlContextPtr view_ctx(ggml_init(params));
+    if (!view_ctx) {
+        return state;
+    }
+    ggml_tensor* chunk = gpu_prompt_pool_->view(
+        view_ctx.get(), prepared.embeddings,
+        range.local_offset, range.token_count);
+    if (!chunk) {
+        return state;
+    }
+
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    if (!gpu_runner_->forward_gpu_tensor_paged(
+            chunk, range.token_count, range.absolute_offset,
+            block_table, block_size, state.logits)) {
+        return state;
+    }
+    const auto t1 = std::chrono::high_resolution_clock::now();
+
+    state.n_past = static_cast<int>(absolute_end);
+    state.stats.prefill_tokens = range.token_count;
+    state.stats.prefill_ms = std::chrono::duration<float, std::milli>(
+        t1 - t0).count();
+    if (!range.produces_logits) {
+        state.logits.clear();
+    }
+    state.ok = true;
+#else
+    (void)absolute_token_offset;
+    (void)requested_tokens;
+    (void)config;
+#endif
+    return state;
+}
+
+GPUPrefillState Pipeline::gpu_prefill_prefix_paged(
+    const std::vector<int>& prefix_ids,
+    int request_id,
+    const std::vector<int>& block_table,
+    int block_size,
+    const InferenceConfig& config
+) {
+    GPUPrefillState state;
+    state.request_id = request_id;
+    state.block_table = block_table;
+    state.block_size = block_size;
+
+#ifdef FUNASR_USE_CUDA
+    if (!config.use_gpu || !is_gpu_ready() || prefix_ids.empty() ||
+        block_table.empty() || block_size <= 0) {
+        return state;
+    }
+
+    const int prefix_len = static_cast<int>(prefix_ids.size());
+    if (!check_context_capacity(prefix_len, config)) {
+        return state;
+    }
+
+    const int embed_dim = model_.config.llm.embedding_length;
+    std::vector<float> prefix_embeds(static_cast<size_t>(prefix_len) * embed_dim);
+    for (int i = 0; i < prefix_len; i++) {
+        PromptBuilder::get_token_embedding(
+            model_.llm.embed_tokens, prefix_ids[static_cast<size_t>(i)],
+            prefix_embeds.data() + static_cast<size_t>(i) * embed_dim, embed_dim);
+    }
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    if (!gpu_runner_->forward_paged(
+            prefix_embeds.data(), prefix_len, 0,
+            block_table, block_size, state.logits)) {
+        return state;
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    state.stats.prefill_tokens = prefix_len;
+    state.stats.prefill_ms = std::chrono::duration_cast<
+        std::chrono::milliseconds>(t1 - t0).count();
+    state.n_past = prefix_len;
+    state.logits.clear();
+    state.ok = true;
+#else
+    (void)prefix_ids; (void)request_id; (void)block_table;
+    (void)block_size; (void)config;
+#endif
+    return state;
+}
+
+GPUPrefillState Pipeline::gpu_prefill_prepared_audio_paged(
+    const PreparedGPUAudio& prepared,
+    int request_id,
+    const std::vector<int>& block_table,
+    int block_size,
+    int cached_prefix_tokens,
+    const InferenceConfig& config
+) {
+    GPUPrefillState state;
+    state.request_id = request_id;
+    state.block_table = block_table;
+    state.block_size = block_size;
+    state.stats.encoder_ms = prepared.encoder_ms;
+
+#ifdef FUNASR_USE_CUDA
+    if (!config.use_gpu || !is_gpu_ready() || !prepared.ok ||
+        !prepared.adaptor_tensor || prepared.audio_frames <= 0) {
+        return state;
+    }
+
+    if (cached_prefix_tokens <= 0) {
+        if (!gpu_prefill_paged(
+                prepared.adaptor_tensor, prepared.audio_frames, nullptr,
+                block_table, block_size, config, state.logits, state.stats)) {
+            return state;
+        }
+        state.n_past = state.stats.prefill_tokens;
+        state.ok = true;
+        return state;
+    }
+
+    const int embed_dim = model_.config.llm.embedding_length;
+    const std::vector<int> suffix_ids = prompt_builder_.suffix_ids(config.prompt);
+    const int suffix_len = static_cast<int>(suffix_ids.size());
+    const int tail_len = prepared.audio_frames + suffix_len;
+    const int total_len = cached_prefix_tokens + tail_len;
+    state.stats.prefill_tokens = total_len;
+    if (!check_context_capacity(total_len, config) ||
+        !ensure_prefill_staging(tail_len, embed_dim)) {
+        return state;
+    }
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    const size_t metadata_size = ggml_tensor_overhead() * 4;
+    ggml_init_params copy_params = {metadata_size, nullptr, true};
+    PipelineGgmlContextPtr copy_ctx(ggml_init(copy_params));
+    if (!copy_ctx) {
+        return state;
+    }
+    ggml_tensor* source = ggml_view_2d(
+        copy_ctx.get(), prepared.adaptor_tensor,
+        embed_dim, prepared.audio_frames, embed_dim * sizeof(float), 0);
+    ggml_tensor* destination = ggml_view_2d(
+        copy_ctx.get(), prefill_stg_tensor_,
+        embed_dim, prepared.audio_frames, embed_dim * sizeof(float), 0);
+    if (ggml_backend_view_init(source) != GGML_STATUS_SUCCESS ||
+        ggml_backend_view_init(destination) != GGML_STATUS_SUCCESS) {
+        return state;
+    }
+    ggml_backend_tensor_copy(source, destination);
+
+    std::vector<float> suffix_embeds(static_cast<size_t>(suffix_len) * embed_dim);
+    for (int i = 0; i < suffix_len; i++) {
+        PromptBuilder::get_token_embedding(
+            model_.llm.embed_tokens, suffix_ids[static_cast<size_t>(i)],
+            suffix_embeds.data() + static_cast<size_t>(i) * embed_dim, embed_dim);
+    }
+    const size_t suffix_offset = static_cast<size_t>(prepared.audio_frames) *
+                                 embed_dim * sizeof(float);
+    ggml_backend_tensor_set(
+        prefill_stg_tensor_, suffix_embeds.data(), suffix_offset,
+        static_cast<size_t>(suffix_len) * embed_dim * sizeof(float));
+
+    if (!gpu_runner_->forward_gpu_tensor_paged(
+            prefill_stg_tensor_, tail_len, cached_prefix_tokens,
+            block_table, block_size, state.logits)) {
+        return state;
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    state.stats.prefill_ms = std::chrono::duration_cast<
+        std::chrono::milliseconds>(t1 - t0).count();
+    state.n_past = total_len;
+    state.ok = true;
+#else
+    (void)prepared; (void)request_id; (void)block_table;
+    (void)block_size; (void)cached_prefix_tokens; (void)config;
+#endif
+    return state;
+}
+
+bool Pipeline::copy_paged_kv_block_rows(
+    int source_block,
+    int destination_block,
+    int valid_rows,
+    int block_size
+) {
+#ifdef FUNASR_USE_CUDA
+    return is_gpu_ready() && gpu_runner_->copy_paged_kv_block_rows(
+        source_block, destination_block, valid_rows, block_size);
+#else
+    (void)source_block; (void)destination_block;
+    (void)valid_rows; (void)block_size;
+    return false;
+#endif
+}
+
+GPUPrefillState Pipeline::gpu_prefill_audio_paged(
+    const AudioSpan& audio,
+    int request_id,
+    const std::vector<int>& block_table,
+    int block_size,
+    const InferenceConfig& config
+) {
+    PreparedGPUAudio prepared = prepare_audio_gpu(audio, request_id);
+    GPUPrefillState state = gpu_prefill_prepared_audio_paged(
+        prepared, request_id, block_table, block_size, 0, config);
+
     return state;
 }
 

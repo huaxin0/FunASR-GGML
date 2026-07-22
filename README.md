@@ -1,22 +1,54 @@
 # FunASR-GGML
 
-C++ speech recognition inference engine using [GGML](https://github.com/ggerganov/ggml), powered by FunASR's SenseVoice architecture.
+![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C)
+![CUDA](https://img.shields.io/badge/CUDA-optional-76B900)
+![GGML](https://img.shields.io/badge/runtime-GGML-4B5563)
+![Model](https://img.shields.io/badge/model-Fun--ASR--Nano--2512-0F766E)
+![License](https://img.shields.io/badge/license-MIT-2563EB)
 
-**Audio → Text**, fully local for core ASR, with optional local web/video tools.
+A native C++17/GGML/CUDA inference runtime for **Fun-ASR-Nano-2512**, focused
+on local speech recognition and high-throughput offline long-video
+transcription.
 
-This branch also includes a long-video offline path inspired by vLLM-style
-continuous batching and paged KV cache, plus a Bilibili browser sidebar for
-turning videos into clickable transcripts, summaries, mind maps, key frames, and
-video Q&A.
+> On an RTX 4070 Laptop GPU, the optimized Q8 runtime transcribes a
+> 6119.29-second recording in **23.097 seconds** median wall time
+> (**264.94x realtime**), versus the original 321.009-second single-request
+> path. Full AISHELL-1 evaluation reaches **2.0035% CER** with 100% coverage.
+
+[Quick Start](#quick-start) · [Runtime Design](#runtime-design) ·
+[Benchmarks](#verified-performance) · [Accuracy](#accuracy-and-stability) ·
+[Benchmark Protocol](docs/benchmarking.md)
+
+The core ASR engine runs locally without a Python runtime. Optional video tools
+add URL ingestion, subtitles, summaries, mind maps, key frames, and a Bilibili
+browser sidebar.
+
+## Performance At A Glance
+
+Verified on RTX 4070 Laptop GPU + Intel i7-13700H:
+
+| Workload | Runtime configuration | Wall time | Throughput / quality |
+| --- | --- | ---: | ---: |
+| 6119.29 s long video, 204 fixed windows | Q8, unified scheduler, batch 48, 224 KV blocks | **23.097 s median** | **264.94x realtime** |
+| Same long video, original single-request path | Q8, batch 1, continuous KV | 321.009 s | 19.06x realtime |
+| AISHELL-1 test, 7176 utterances / 36108.919 s | Q8, batch 48, 112 KV blocks | **151.778 s** | **237.91x realtime, 2.0035% CER** |
+
+The long-video path is **13.90x faster** than the original single-request
+baseline. The AISHELL gate produced 7176/7176 hypotheses, with no missing or
+empty outputs. Numbers are workload and hardware specific; benchmark scope and
+comparison rules are documented in [docs/benchmarking.md](docs/benchmarking.md).
 
 ## Features
 
 - **Pure C++17** — no Python runtime, no external dependencies (except GGML)
 - **GGUF model format** — single file contains weights + tokenizer + config
-- **CPU + GPU** — LLM decoder runs on CUDA GPU (Encoder/Adaptor stay on CPU)
+- **CPU + GPU** — CPU fallback plus an offline CUDA path for Encoder, Adaptor, and LLM
 - **VAD segmentation** — energy VAD by default, optional Silero VAD model via ggml
 - **Real-time microphone** — VAD-based streaming recognition with [miniaudio](https://github.com/mackron/miniaudio)
-- **Long-video offline batching** — fixed-window or VAD chunks with scheduler batching, paged KV, and graph cache
+- **Unified offline scheduler** — chunked Prefill and continuous Decode share one token budget
+- **Paged KV runtime** — global physical pool, logical block tables, prefix sharing, COW, and dynamic append
+- **CUDA fast path** — batched Encoder/Adaptor, Q8 Decoder, Paged Attention, Paged KV Write, and CUDA Graph LRU
+- **Measured quality gate** — corpus-level CER, strict coverage checks, and repeat consistency auditing
 - **Video workflow** — URL/local media helpers for Bilibili, YouTube, Douyin, and local files
 - **Bilibili learning sidebar** — Chrome/Edge MV3 extension for transcripts, DeepSeek summaries, mind maps, key frames, and Q&A
 - **C ABI SDK** — `funasr_sdk` wrapper for Qt/Windows integration and hotword injection
@@ -29,24 +61,83 @@ current snapshot contains three working tracks:
 
 1. **Core local ASR**: C++17 GGUF loader, CPU/GPU decoder, realtime microphone,
    CLI transcription, VAD/window chunking, and a C ABI SDK.
-2. **Offline long-video throughput**: an offline scheduler that batches chunk
-   decode steps, uses paged KV cache for decode requests, keeps a stable decode
-   graph shape, and caches the hottest graph.
+2. **Offline long-video throughput**: a unified request scheduler that packs
+   prefill and decode work under one token budget, uses a global paged KV pool,
+   batches the acoustic frontend, and retains frequently reused CUDA graphs.
 3. **Video learning workflow**: a local FastAPI web service and a no-build
    Bilibili sidebar extension that can analyze the current video, reuse cached
    results, generate study notes, render a clickable mind map, extract key
    frames, and answer questions against the transcript.
 
-## Architecture
+## Runtime Design
 
+```text
+Audio / long video
+    |
+    v
+Window or VAD chunk planner
+    |
+    +---- request 0 ---- request 1 ---- ... ---- request N
+    |
+    v
+Frontend pipeline
+    |- bounded length bucket
+    |- asynchronous CPU Fbank workers             [80-dim Mel + LFR]
+    `- batched CUDA Encoder + Adaptor              [560,T] -> [1024,T]
+    |
+    v
+Prompt preparation
+    |- shared task/ChatML prefix KV
+    `- request-owned audio prompt embeddings
+    |
+    v
+Unified Scheduler                         token budget per step: 1024
+    |- active Decode request               1 token / request / step
+    `- waiting Prefill request          <= 512 tokens / request / step
+    |
+    v
+Packed Mixed GPU Batch
+    |- Q8 Qwen3 28-layer Decoder
+    |- custom Paged KV Write
+    |- custom Paged Attention
+    `- LM Head -> argmax -> next token
+    |
+    v
+EOS / token limit -> BPE text -> release Prompt and KV blocks
 ```
-WAV (16kHz)
-  → Fbank (80-dim mel + LFR) → [560, T]
-  → Audio Encoder (50 SANM + 20 TP layers, FSMN) → [512, T]        [CPU]
-  → Audio Adaptor (linear + 2 attention blocks) → [1024, T]         [CPU]
-  → LLM Decoder (28-layer Qwen3, GQA-8, RoPE, KV Cache) → logits   [CPU or GPU]
-  → BPE Decode → Text
+
+### Request-centric scheduling
+
+The scheduler operates on requests rather than worker threads. In one Decode
+step, up to 48 independent requests contribute one token row to the same GPU
+batch. Per-request positions, KV lengths, and block tables keep their attention
+histories isolated.
+
+Decode is scheduled first to keep active generation moving. Remaining token
+budget is used for chunked Prefill, allowing Prefill and Decode work to share a
+single mixed GPU forward instead of running as two globally serialized phases.
+
+### Paged KV ownership
+
+```text
+Request A logical blocks [0, 1, 2] -> physical blocks [17, 31,  8]
+Request B logical blocks [0, 1, 2] -> physical blocks [42, 11, 29]
+Shared task prefix       [0]       -> physical block  [ 5] (ref-counted)
 ```
+
+Scheduler concurrency and physical KV capacity are independent. Blocks are
+appended on demand, shared prefix blocks use reference counts, partial shared
+blocks use copy-on-write before mutation, and completed requests return blocks
+to the global free list. KV backpressure keeps prepared requests queued when
+capacity is temporarily unavailable.
+
+### CUDA Graph cache
+
+Mixed graphs are stored in a bounded multi-entry LRU. A graph signature covers
+Prefill/Decode token counts, KV bucket, selected rows, and Prefill layout. A new
+shape executes transiently on its first observation and enters the LRU only
+after it repeats, preventing one-off variable-length Prefill shapes from
+evicting hot Decode graphs.
 
 ## Quick Start
 
@@ -55,46 +146,52 @@ WAV (16kHz)
 ```bash
 git clone --recursive https://github.com/huaxin0/FunASR-GGML.git
 cd FunASR-GGML
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
+tools/apply_ggml_runtime_patch.sh
+cmake -S . -B build -DFUNASR_BUILD_TESTS=ON
+cmake --build build -j$(nproc)
 ```
 
 ### Build (with CUDA GPU)
 
 ```bash
-cmake .. -DFUNASR_CUDA=ON
-make -j$(nproc)
+cmake -S . -B build-cuda \
+  -DFUNASR_CUDA=ON \
+  -DFUNASR_BUILD_TESTS=ON
+cmake --build build-cuda -j$(nproc)
 ```
 
 ### Run
 
 ```bash
 # File transcription
-./test_pipeline ../FunAsr_q8.bin audio.wav
+./build/funasr-cli -m FunAsr_q8.bin -f audio.wav -otxt
 
 # GPU inference
-./test_gpu ../FunAsr_q8.bin audio.wav
+./build-cuda/funasr-cli -m FunAsr_q8.bin -f audio.wav --gpu -otxt
 
 # Silero VAD subtitles
 wget https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin
-./funasr-cli -m ../FunAsr_q8.bin -f audio.mp3 --gpu --chunk-mode vad \
+./build-cuda/funasr-cli -m FunAsr_q8.bin -f audio.mp3 --gpu --chunk-mode vad \
   --vad-model ggml-silero-v6.2.0.bin -osrt -o audio.srt
 
-# Fixed-window long audio transcription
-./funasr-cli -m ../FunAsr_q8.bin -f audio.mp3 --gpu \
-  --ctx-size 4096 --chunk-mode window --chunk-sec 30 \
-  -osrt -o audio.srt
+# Optimized long-video transcription
+./build-cuda/funasr-cli -m FunAsr_q8.bin -f long_video.wav --gpu \
+  --offline-preset long-video -osrt -o long_video.srt
 
 # Video URL transcription helper
 python3 tools/funasr_video_ui.py
 
 # Real-time microphone (CPU)
-./test_realtime ../FunAsr_q8.bin
+./build/test_realtime FunAsr_q8.bin
 
 # Real-time microphone (GPU)
-./test_realtime ../FunAsr_q8.bin --gpu
+./build-cuda/test_realtime FunAsr_q8.bin --gpu
 ```
+
+`long-video` enables the verified unified scheduler, task-prefix KV reuse,
+dynamic blocks, frontend batching/prefetch, length bucketing, a 16-entry Graph
+LRU, and GPU-memory-aware concurrency tuning. Use `long-video-legacy` to isolate
+regressions against the older Decode-only path.
 
 ## Usage (C++ API)
 
@@ -403,37 +500,51 @@ rebuilding and reallocating everything at each decode step. The offline path in
 `pipeline/offline_batching.*` and `test/test_offline_batching.cpp` is the
 throughput-oriented route.
 
-Recommended RTX 4070 Laptop 8GB command used during profiling:
+The product-facing fast preset enables the measured scheduler configuration and
+automatically sizes concurrency and the physical KV pool from available GPU
+memory:
 
 ```bash
-./build-cuda/test_offline_batching FunAsr_q8.bin \
-  outputs/video_asr/20260502_130430/media/source_16k.wav \
-  --gpu --kv-mode paged --batch-size 12 --ctx-size 4096 \
-  --kv-block-size 128 --chunk-mode window --chunk-sec 30 \
-  --max-tokens 220
+./build-cuda/funasr-cli \
+  -m FunAsr_q8.bin -f long_video.wav --gpu \
+  --offline-preset long-video -o transcript.txt
 ```
+
+Use `--offline-preset long-video-legacy` as the regression escape hatch for the
+older decode-only scheduler.
 
 The current fast path combines:
 
-- scheduler batching across independent audio chunks
-- paged KV cache for decode requests
-- token-id paged batch decode, avoiding host embedding fallback
-- dynamic paged KV write so the decode graph does not depend on physical KV rows
-- bucketed decode shapes and graph cache for the hottest batch shape
+- a unified token budget shared by chunked prefill and continuous decode
+- task-prefix KV reuse, copy-on-write, and dynamic block append
+- a physical paged KV pool independent of scheduler concurrency
+- batched Encoder/Adaptor plus asynchronous CPU Fbank prefetch
+- bounded length bucketing for variable-duration frontend batches
+- a multi-entry LRU CUDA Graph cache with repeated-shape admission
+- GPU-memory-aware batch/KV-pool auto tuning
 
 Representative profiling result on RTX 4070 Laptop GPU + i7-13700H:
 
 | Workload | Config | Wall time | Throughput | Notes |
 | --- | --- | ---: | ---: | --- |
-| ~6119 s audio (~102 min) | paged KV, batch=12, block=128, 30 s chunks | 52-59 s | 100-117 audio-sec/s | End-to-end offline test path |
-| Same workload, graph cache snapshot | paged KV, batch=12 | 52.12 s | 117.42 audio-sec/s | Best recorded local run |
-| Single-request continuous baseline | batch=1 | 308.63 s | 19.8 audio-sec/s | Before scheduler batching |
+| ~6119 s audio (~102 min) | Q8, batch=48, 224 blocks, 16 graphs | **23.10 s** median | **264.94x realtime** | Three measured repeats |
+| Same workload | previous batched-frontend path, batch=40 | 27.69 s median | 220.99x realtime | Before prefetch/LRU tuning |
+| Same workload | single-request continuous baseline | 321.01 s | 19.06x realtime | Before scheduler batching |
+| AISHELL-1 test, 7176 utterances | Q8 unified path, batch=48, 112 blocks | 151.78 s | 237.91x realtime | CER 2.0035%, strict gate passed |
+
+The experimental second CUDA stream for Encoder/Adaptor is available through
+`--gpu-frontend-overlap on`, but is intentionally off in the preset: on the
+RTX 4070 Laptop GPU it competed with decoder kernels and increased wall time.
 
 These numbers are workload and GPU dependent. They are included to show the
 order of magnitude and the benchmark shape, not as a universal guarantee. See
 `docs/superpowers/notes/2026-05-27-vllm-style-offline-asr-retrospective.md` and
 `docs/superpowers/notes/2026-06-11-offline-decode-kernel-profiling.md` for the
 full optimization notes.
+
+For reproducible local C++, official FunASR-vLLM, and sherpa-onnx comparisons,
+use `tools/benchmark_suite.py`. The complete protocol, commands, result schema,
+and fairness rules are documented in [docs/benchmarking.md](docs/benchmarking.md).
 
 ## Video URL Transcription
 
@@ -551,21 +662,88 @@ The model file `FunAsr_q8.bin` is a GGUF-format file containing:
 python hf_convert_ggml_q8.py --model-dir <huggingface_model> --output FunAsr_q8.bin
 ```
 
-## Performance
+## Verified Performance
 
-Tested on RTX 4070 Laptop GPU + i7-13700H:
+### Long-video optimization history
 
-| Mode | Workload | Result |
-| ---- | -------- | ------ |
-| CPU realtime | Single utterance | Prefill 1052 ms, decode ~12 tok/s, RTF ~0.91 |
-| GPU realtime | Single utterance | Prefill 23 ms, decode 55-62 tok/s, RTF ~0.28-0.35 |
-| GPU offline baseline | ~6119 s audio, batch=1 | 308.63 s wall, ~19.8 audio-sec/s |
-| GPU offline paged batch | ~6119 s audio, batch=12, block=128 | 52-59 s wall, ~100-117 audio-sec/s |
+Fixed workload: 6119.29 seconds of audio, 204 externally fixed 30-second
+windows, Q8 model, greedy Decode, RTX 4070 Laptop GPU.
 
-The offline numbers come from the dedicated long-video benchmark path and use
-30-second fixed windows. For comparable results, keep the same chunk shape and
-report `wall`, `rtf`, `audio_sec/s`, `tokens/s`, `batch_size`, `kv_mode`, and
-`kv_block_size`.
+| Runtime stage | Wall time | Speedup vs. original | Main change |
+| --- | ---: | ---: | --- |
+| Original single-request runtime | 321.009 s | 1.00x | Continuous KV, batch 1 |
+| Paged Decode batching, batch 12 | 55.951 s | 5.74x | Request scheduler + Paged Attention |
+| Unified scheduler + batched frontend | 27.691 s median | 11.59x | Mixed Prefill/Decode + GPU Encoder/Adaptor |
+| Current optimized runtime | **23.097 s median** | **13.90x** | Fbank prefetch + Graph LRU + batch/KV tuning |
+
+Current batch-48 repeats were `23.340 / 23.080 / 23.097 s`; all three produced
+identical token sequences for all 204 chunks. Batch 56 consumed 256 blocks but
+had a slower `23.263 s` median, so the 8GB auto-tuned profile uses batch 48 and
+224 blocks.
+
+The repository's existing same-machine fixed-window reference measured the
+official FunASR-vLLM BF16 path at `42.770 s` median. The current C++ Q8 path is
+about 1.85x faster for this specific workload. This is not a precision-matched
+universal comparison: report Q8 vs. BF16, feature scope, chunking, and timing
+boundaries together with the number.
+
+### Runtime observability
+
+| Signal | Long video | AISHELL-1 | Interpretation |
+| --- | ---: | ---: | --- |
+| Average active Decode batch | 36.98 / 48 | workload dependent | GPU batch remains populated |
+| Mixed CUDA Graph hit rate | 66.60% | 6.22% | Variable short requests create many more shapes |
+| Fbank prefetch ready rate | >98% | 98.38% | CPU feature work is mostly hidden |
+| Frontend padding rate | 0.01% | 5.57% | Length bucket is most useful for variable audio |
+| KV ownership errors | 0 | 0 | Block tables/refcounts returned cleanly |
+
+Graph hit rate is a diagnostic, not the optimization target by itself. AISHELL
+has 1862 observed mixed shapes; batch 48 is faster than batch 40 even though its
+Graph hit rate is lower.
+
+### Reproduce the measurements
+
+```bash
+# Long-video batch/KV/Graph matrix
+tools/bench_unified_runtime.sh --repeat 3 \
+  --profiles optimized48:48:224:16:on:32:off,optimized56:56:256:16:on:32:off
+
+# Full AISHELL-1 coverage and CER gate
+tools/bench_asr_accuracy.sh
+
+# Local C++, official PyTorch/vLLM, and optional sherpa-onnx comparison
+python3 tools/benchmark_suite.py --help
+```
+
+See [docs/benchmarking.md](docs/benchmarking.md) for timing scope, environment
+isolation, artifacts, and fair-comparison rules.
+
+## Accuracy And Stability
+
+Full AISHELL-1 test result:
+
+| Metric | Verified result |
+| --- | ---: |
+| Utterance coverage | **7176 / 7176 (100%)** |
+| Missing / empty / malformed | **0 / 0 / 0** |
+| Corpus CER | **2.0035%** |
+| Audio duration | 36108.919 s |
+| End-to-end wall | 151.778 s |
+| Audio throughput | 237.91x realtime |
+| Peak physical KV usage | 85 / 112 blocks |
+
+The previous path measured 1.9902% CER; the optimized path changes CER by only
+0.0133 percentage points and passes the strict 2.2% release gate. Core runtime
+verification also covers scheduler planning, mixed metadata, GPU embedding
+ownership, block COW/refcounts, CLI presets, result coverage, and benchmark
+parsing.
+
+The verified boundary is single-GPU offline batch transcription. Multi-process
+serving, request cancellation, long-duration fault injection, arbitrary mixed
+Prefill padding, multi-GPU execution, and broader multilingual/noisy-domain
+quality suites remain future work. Experimental single-GPU Frontend/LLM stream
+overlap is implemented but disabled by default because it regressed performance
+on the RTX 4070 Laptop GPU.
 
 ## Project Structure
 
@@ -587,16 +765,23 @@ FunASR-GGML/
 │   ├── kv_cache.hpp         #   CPU KV cache (RAII)
 │   ├── llm_ops.hpp/.cpp     #   28-layer Qwen3 decoder (CPU)
 │   ├── gpu_context.hpp      #   GPU resource management
-│   ├── llm_ops_gpu.hpp/.cpp #   LLM decoder (GPU, ggml_cpy)
+│   ├── encoder_adaptor_gpu.hpp # Batched CUDA acoustic frontend
+│   ├── gpu_embedding_pool.* #   Owning GPU prompt-embedding pool
+│   ├── gpu_mixed_runner.*   #   Packed Prefill/Decode + Graph LRU
+│   ├── llm_ops_gpu.hpp/.cpp #   Q8 Decoder + Paged KV/Attention graph
 │   ├── gpu_runner.hpp       #   GPU graph execution (gallocr)
 │   └── graph_runner.hpp     #   CPU graph execution helper
 ├── pipeline/                # User-facing API
 │   ├── prompt_builder.hpp   #   ChatML prompt construction
+│   ├── mixed_batch.*        #   Per-request packed GPU metadata
+│   ├── offline_batching.*   #   Unified scheduler + Paged KV ownership
 │   ├── pipeline.hpp/.cpp    #   CPU/GPU inference pipeline
 │   ├── recognizer.hpp       #   One-line API
 │   ├── audio_capture.hpp/.cpp # Microphone capture (miniaudio)
 │   └── realtime.hpp         #   Real-time VAD + recognition
-├── test/                    # Tests and demos
+├── tools/                   # Benchmark, CER gate, and video helpers
+├── test/                    # Unit tests, accuracy runner, and demos
+├── patches/                 # Reproducible GGML runtime extensions
 └── third_party/
     ├── ggml/                #   GGML library (submodule)
     └── miniaudio.h          #   Audio I/O (header-only)

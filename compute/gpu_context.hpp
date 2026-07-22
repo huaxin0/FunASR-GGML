@@ -91,6 +91,16 @@ public:
     GPUContext(const GPUContext&) = delete;
     GPUContext& operator=(const GPUContext&) = delete;
 
+    static int resolve_physical_kv_rows(
+        int n_ctx,
+        int n_slots,
+        int physical_kv_rows) {
+        if (physical_kv_rows > 0) {
+            return physical_kv_rows;
+        }
+        return std::max(1, n_ctx) * std::max(1, n_slots);
+    }
+
     // ============================================================
     // 完整初始化: backend + weights + kv_cache
     // cpu_weights: CPU 上加载的 LLM 权重
@@ -99,14 +109,15 @@ public:
     // gpu_id: CUDA 设备 ID
     // ============================================================
     bool init(const LLMWeights& cpu_weights, const LLMConfig& cfg,
-              int n_ctx = 2048, int gpu_id = 0, int n_slots = 1)
+              int n_ctx = 2048, int gpu_id = 0, int n_slots = 1,
+              int physical_kv_rows = 0)
     {
         printf("\n========== GPUContext Init ==========\n");
         cfg_ = cfg;
 
         if (!init_backend(gpu_id)) return false;
         if (!load_weights(cpu_weights)) return false;
-        if (!init_kv_cache(n_ctx, n_slots)) return false;
+        if (!init_kv_cache(n_ctx, n_slots, physical_kv_rows)) return false;
 
         initialized_ = true;
         printf("========== GPUContext Ready ==========\n\n");
@@ -315,14 +326,21 @@ private:
     // ============================================================
     // 初始化 GPU KV Cache
     // ============================================================
-    bool init_kv_cache(int n_ctx, int n_slots = 1) {
+    bool init_kv_cache(
+        int n_ctx,
+        int n_slots = 1,
+        int physical_kv_rows = 0) {
         n_slots = std::max(1, n_slots);
-        printf("[GPUContext] Init GPU KV Cache (n_ctx=%d, slots=%d)...\n", n_ctx, n_slots);
+        const int resolved_physical_rows = resolve_physical_kv_rows(
+            n_ctx, n_slots, physical_kv_rows);
+        printf("[GPUContext] Init GPU KV Cache "
+               "(n_ctx=%d, slots=%d, physical_rows=%d)...\n",
+               n_ctx, n_slots, resolved_physical_rows);
 
         kv_cache_.n_ctx    = n_ctx;
         kv_cache_.n_past   = 0;
         kv_cache_.n_slots  = n_slots;
-        kv_cache_.physical_rows = n_ctx * n_slots;
+        kv_cache_.physical_rows = resolved_physical_rows;
         kv_cache_.n_layers = cfg_.block_count;
         kv_cache_.kv_dim   = cfg_.kv_dim();
 

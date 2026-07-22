@@ -56,6 +56,7 @@ add_library(funasr_compute STATIC
     compute/adaptor_ops.cpp
     compute/llm_ops.cpp
     compute/gpu_embedding_pool.cpp
+    compute/gpu_mixed_runner.cpp
     compute/silero_vad.cpp
 )
 if(FUNASR_CUDA)
@@ -73,6 +74,7 @@ add_library(funasr_pipeline STATIC
     pipeline/chunking.cpp
     pipeline/offline_batching.cpp
     pipeline/unified_scheduler.cpp
+    pipeline/mixed_batch.cpp
 )
 target_link_libraries(funasr_pipeline PUBLIC funasr_model funasr_compute)
 if(UNIX AND NOT APPLE)
@@ -141,6 +143,9 @@ if(FUNASR_BUILD_TESTS AND EXISTS "${CMAKE_SOURCE_DIR}/test/test_config.cpp")
     add_executable(test_unified_scheduler test/test_unified_scheduler.cpp)
     target_link_libraries(test_unified_scheduler PRIVATE funasr_pipeline)
 
+    add_executable(test_mixed_batch test/test_mixed_batch.cpp)
+    target_link_libraries(test_mixed_batch PRIVATE funasr_pipeline)
+
     add_executable(test_gpu_embedding_pool test/test_gpu_embedding_pool.cpp)
     target_link_libraries(test_gpu_embedding_pool PRIVATE funasr_compute)
 
@@ -155,6 +160,9 @@ if(FUNASR_BUILD_TESTS AND EXISTS "${CMAKE_SOURCE_DIR}/test/test_config.cpp")
 
     add_executable(test_benchmark test/test_benchmark.cpp)
     target_link_libraries(test_benchmark PRIVATE funasr_pipeline)
+
+    add_executable(test_accuracy_benchmark test/test_accuracy_benchmark.cpp)
+    target_link_libraries(test_accuracy_benchmark PRIVATE funasr_pipeline)
 
     add_executable(test_cli_options test/test_cli_options.cpp)
     target_link_libraries(test_cli_options PRIVATE funasr_pipeline)

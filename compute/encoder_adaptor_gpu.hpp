@@ -11,8 +11,11 @@
 #include <vector>
 #include <memory>
 #include <chrono>
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <limits>
 
 namespace funasr {
 
@@ -191,6 +194,193 @@ public:
 
         // 返回 GPU 上的 staging tensor，调用者可直接使用
         return staging_adp_;
+    }
+
+    // True batched frontend. Each sequence occupies one ne[2] slice, so SANM
+    // Attention and FSMN stay isolated while QKV/FFN GEMMs execute as a batch.
+    // Variable lengths are padded to max_frames and masked in every attention
+    // layer. The returned tensor is [adaptor_dim, max_frames, batch] and remains
+    // valid until the next batched frontend call.
+    ggml_tensor* forward_batch_on_gpu(
+            const std::vector<const float*>& fbank_data,
+            int fbank_dim,
+            const std::vector<int>& frames,
+            std::vector<int>& out_frames,
+            int& output_stride_frames,
+            long& total_ms) {
+        out_frames.clear();
+        output_stride_frames = 0;
+        total_ms = 0;
+        const int batch = static_cast<int>(fbank_data.size());
+        if (!initialized_ || batch <= 0 ||
+            frames.size() != fbank_data.size() ||
+            fbank_dim != input_dim_) {
+            return nullptr;
+        }
+
+        int max_frames = 0;
+        for (int i = 0; i < batch; ++i) {
+            if (!fbank_data[static_cast<size_t>(i)] ||
+                frames[static_cast<size_t>(i)] <= 0) {
+                return nullptr;
+            }
+            max_frames = std::max(max_frames, frames[static_cast<size_t>(i)]);
+        }
+        if (max_frames <= 0 ||
+            static_cast<size_t>(batch) >
+                std::numeric_limits<size_t>::max() /
+                    static_cast<size_t>(max_frames) /
+                    static_cast<size_t>(fbank_dim)) {
+            return nullptr;
+        }
+
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        const size_t input_elements = static_cast<size_t>(fbank_dim) *
+            max_frames * batch;
+        std::vector<float> packed_fbank(input_elements, 0.0f);
+        for (int i = 0; i < batch; ++i) {
+            const size_t destination = static_cast<size_t>(i) *
+                max_frames * fbank_dim;
+            const size_t count = static_cast<size_t>(
+                frames[static_cast<size_t>(i)]) * fbank_dim;
+            std::memcpy(
+                packed_fbank.data() + destination,
+                fbank_data[static_cast<size_t>(i)],
+                count * sizeof(float));
+        }
+
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+        const size_t max_size = std::numeric_limits<size_t>::max();
+        const size_t frame_count = static_cast<size_t>(max_frames);
+        const size_t batch_count = static_cast<size_t>(batch);
+        if (frame_count > max_size / frame_count ||
+            frame_count * frame_count > max_size / batch_count) {
+            return nullptr;
+        }
+        const size_t mask_elements = frame_count * frame_count * batch_count;
+        std::vector<ggml_fp16_t> attention_mask(mask_elements, zero);
+        std::vector<float> valid_mask(
+            static_cast<size_t>(max_frames) * batch, 0.0f);
+        for (int b = 0; b < batch; ++b) {
+            const int valid = frames[static_cast<size_t>(b)];
+            float* valid_row = valid_mask.data() +
+                static_cast<size_t>(b) * max_frames;
+            std::fill(valid_row, valid_row + valid, 1.0f);
+            ggml_fp16_t* sequence_mask = attention_mask.data() +
+                static_cast<size_t>(b) * max_frames * max_frames;
+            for (int query = 0; query < max_frames; ++query) {
+                std::fill(
+                    sequence_mask + static_cast<size_t>(query) * max_frames + valid,
+                    sequence_mask + static_cast<size_t>(query + 1) * max_frames,
+                    neg_inf);
+            }
+        }
+
+        const size_t enc_ctx_size = 256ULL * 1024 * 1024;
+        const ggml_init_params enc_params = {
+            enc_ctx_size, nullptr, true};
+        GgmlContextPtr ctx_enc(ggml_init(enc_params));
+        if (!ctx_enc) {
+            return nullptr;
+        }
+        ggml_tensor* fbank = ggml_new_tensor_3d(
+            ctx_enc.get(), GGML_TYPE_F32, fbank_dim, max_frames, batch);
+        ggml_tensor* enc_attention_mask = ggml_new_tensor_4d(
+            ctx_enc.get(), GGML_TYPE_F16,
+            max_frames, max_frames, 1, batch);
+        ggml_tensor* enc_valid_mask = ggml_new_tensor_3d(
+            ctx_enc.get(), GGML_TYPE_F32, 1, max_frames, batch);
+        ggml_set_input(fbank);
+        ggml_set_input(enc_attention_mask);
+        ggml_set_input(enc_valid_mask);
+
+        const bool previous_fsmn = fsmn_fused_cuda_enabled();
+        set_fsmn_fused_cuda_enabled(true);
+        ggml_tensor* enc_out = encoder_forward_batched(
+            ctx_enc.get(), fbank, enc_attention_mask, enc_valid_mask,
+            encoder_weights_, encoder_cfg_);
+        set_fsmn_fused_cuda_enabled(previous_fsmn);
+        ggml_set_output(enc_out);
+        ggml_cgraph* graph_enc = ggml_new_graph_custom(
+            ctx_enc.get(), 131072, false);
+        ggml_build_forward_expand(graph_enc, enc_out);
+        if (!ggml_gallocr_alloc_graph(allocr_encoder_, graph_enc)) {
+            printf("[GPU-EA] Failed to alloc batched encoder graph\n");
+            return nullptr;
+        }
+        ggml_backend_tensor_set(
+            fbank, packed_fbank.data(), 0,
+            packed_fbank.size() * sizeof(float));
+        ggml_backend_tensor_set(
+            enc_attention_mask, attention_mask.data(), 0,
+            attention_mask.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(
+            enc_valid_mask, valid_mask.data(), 0,
+            valid_mask.size() * sizeof(float));
+        if (ggml_backend_graph_compute(
+                backend_, graph_enc) != GGML_STATUS_SUCCESS) {
+            printf("[GPU-EA] Batched encoder graph compute failed\n");
+            return nullptr;
+        }
+
+        const int enc_out_dim = static_cast<int>(enc_out->ne[0]);
+        const int enc_out_frames = static_cast<int>(enc_out->ne[1]);
+        if (enc_out->ne[2] != batch ||
+            !ensure_batch_staging_buffer(
+                enc_out_dim, enc_out_frames,
+                adaptor_cfg_.output_dim, enc_out_frames, batch)) {
+            printf("[GPU-EA] Batched encoder staging failed\n");
+            return nullptr;
+        }
+        ggml_backend_tensor_copy(enc_out, staging_enc_batch_);
+
+        const ggml_init_params adp_params = {
+            128ULL * 1024 * 1024, nullptr, true};
+        GgmlContextPtr ctx_adp(ggml_init(adp_params));
+        if (!ctx_adp) {
+            return nullptr;
+        }
+        ggml_tensor* adaptor_input = ggml_new_tensor_3d(
+            ctx_adp.get(), GGML_TYPE_F32,
+            enc_out_dim, enc_out_frames, batch);
+        ggml_tensor* adp_attention_mask = ggml_new_tensor_4d(
+            ctx_adp.get(), GGML_TYPE_F16,
+            enc_out_frames, enc_out_frames, 1, batch);
+        ggml_set_input(adaptor_input);
+        ggml_set_input(adp_attention_mask);
+        ggml_tensor* adp_out = adaptor_forward_batched(
+            ctx_adp.get(), adaptor_input, adp_attention_mask,
+            adaptor_weights_, adaptor_cfg_);
+        ggml_set_output(adp_out);
+        ggml_cgraph* graph_adp = ggml_new_graph_custom(
+            ctx_adp.get(), 16384, false);
+        ggml_build_forward_expand(graph_adp, adp_out);
+        if (!ggml_gallocr_alloc_graph(allocr_adaptor_, graph_adp)) {
+            printf("[GPU-EA] Failed to alloc batched adaptor graph\n");
+            return nullptr;
+        }
+        ggml_backend_tensor_copy(staging_enc_batch_, adaptor_input);
+        ggml_backend_tensor_set(
+            adp_attention_mask, attention_mask.data(), 0,
+            attention_mask.size() * sizeof(ggml_fp16_t));
+        if (ggml_backend_graph_compute(
+                backend_, graph_adp) != GGML_STATUS_SUCCESS) {
+            printf("[GPU-EA] Batched adaptor graph compute failed\n");
+            return nullptr;
+        }
+        if (adp_out->ne[0] != adaptor_cfg_.output_dim ||
+            adp_out->ne[1] != enc_out_frames || adp_out->ne[2] != batch) {
+            return nullptr;
+        }
+        ggml_backend_tensor_copy(adp_out, staging_adp_batch_);
+
+        out_frames = frames;
+        output_stride_frames = enc_out_frames;
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            t1 - t0).count();
+        return staging_adp_batch_;
     }
 
     int forward(const float* fbank_data, int fbank_dim, int frames,
@@ -389,6 +579,15 @@ private:
     int staging_adp_dim_ = 0;
     int staging_adp_frames_ = 0;
 
+    ggml_context* batch_staging_ctx_ = nullptr;
+    ggml_backend_buffer_t batch_staging_buffer_ = nullptr;
+    ggml_tensor* staging_enc_batch_ = nullptr;
+    ggml_tensor* staging_adp_batch_ = nullptr;
+    int batch_staging_enc_dim_ = 0;
+    int batch_staging_adp_dim_ = 0;
+    int batch_staging_frames_ = 0;
+    int batch_staging_size_ = 0;
+
     bool initialized_ = false;
 
     // 确保 staging buffer 足够大，返回 false 表示分配失败
@@ -446,6 +645,63 @@ private:
         printf("[GPU-EA] Staging buffer: %.2f MB (enc=[%d,%d] adp=[%d,%d])\n",
                ggml_backend_buffer_get_size(staging_buffer_) / 1e6,
                enc_dim, enc_frames, adp_dim, adp_frames);
+        return true;
+    }
+
+    bool ensure_batch_staging_buffer(
+            int enc_dim, int frames, int adp_dim,
+            int adp_frames, int batch) {
+        if (frames != adp_frames || enc_dim <= 0 || adp_dim <= 0 ||
+            frames <= 0 || batch <= 0) {
+            return false;
+        }
+        if (batch_staging_buffer_ &&
+            batch_staging_enc_dim_ == enc_dim &&
+            batch_staging_adp_dim_ == adp_dim &&
+            batch_staging_frames_ == frames &&
+            batch_staging_size_ == batch) {
+            return true;
+        }
+        if (batch_staging_buffer_) {
+            ggml_backend_buffer_free(batch_staging_buffer_);
+            batch_staging_buffer_ = nullptr;
+        }
+        if (batch_staging_ctx_) {
+            ggml_free(batch_staging_ctx_);
+            batch_staging_ctx_ = nullptr;
+        }
+        staging_enc_batch_ = nullptr;
+        staging_adp_batch_ = nullptr;
+
+        const ggml_init_params params = {
+            ggml_tensor_overhead() * 4, nullptr, true};
+        batch_staging_ctx_ = ggml_init(params);
+        if (!batch_staging_ctx_) {
+            return false;
+        }
+        staging_enc_batch_ = ggml_new_tensor_3d(
+            batch_staging_ctx_, GGML_TYPE_F32,
+            enc_dim, frames, batch);
+        staging_adp_batch_ = ggml_new_tensor_3d(
+            batch_staging_ctx_, GGML_TYPE_F32,
+            adp_dim, frames, batch);
+        batch_staging_buffer_ = ggml_backend_alloc_ctx_tensors(
+            batch_staging_ctx_, backend_);
+        if (!batch_staging_buffer_) {
+            ggml_free(batch_staging_ctx_);
+            batch_staging_ctx_ = nullptr;
+            staging_enc_batch_ = nullptr;
+            staging_adp_batch_ = nullptr;
+            return false;
+        }
+        batch_staging_enc_dim_ = enc_dim;
+        batch_staging_adp_dim_ = adp_dim;
+        batch_staging_frames_ = frames;
+        batch_staging_size_ = batch;
+        printf("[GPU-EA] Batch staging: %.2f MB "
+               "(enc=[%d,%d,%d] adp=[%d,%d,%d])\n",
+               ggml_backend_buffer_get_size(batch_staging_buffer_) / 1e6,
+               enc_dim, frames, batch, adp_dim, frames, batch);
         return true;
     }
 
@@ -640,6 +896,21 @@ private:
     }
 
     void cleanup() {
+        if (batch_staging_buffer_) {
+            ggml_backend_buffer_free(batch_staging_buffer_);
+            batch_staging_buffer_ = nullptr;
+        }
+        if (batch_staging_ctx_) {
+            ggml_free(batch_staging_ctx_);
+            batch_staging_ctx_ = nullptr;
+        }
+        staging_enc_batch_ = nullptr;
+        staging_adp_batch_ = nullptr;
+        batch_staging_enc_dim_ = 0;
+        batch_staging_adp_dim_ = 0;
+        batch_staging_frames_ = 0;
+        batch_staging_size_ = 0;
+
         if (staging_buffer_) {
             ggml_backend_buffer_free(staging_buffer_);
         staging_buffer_ = nullptr;

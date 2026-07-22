@@ -21,6 +21,10 @@ struct AudioChunk {
     float end_sec = 0.0f;
 };
 
+float selected_audio_duration_seconds(
+    const std::vector<AudioChunk>& chunks,
+    int sample_rate);
+
 std::vector<AudioChunk> split_audio_by_window(
     const std::vector<float>& samples,
     int sample_rate,

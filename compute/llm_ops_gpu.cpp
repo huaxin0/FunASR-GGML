@@ -649,10 +649,12 @@ static ggml_tensor* gpu_gqa_forward_paged_batch_decode(
 
     const size_t k_cur_row_size = ggml_row_size(k_cur->type, kv_dim);
     const size_t v_cur_row_size = ggml_row_size(v_cur->type, kv_dim);
+    ggml_tensor* kv_write_dependency = nullptr;
     if (env_flag_enabled("FUNASR_PAGED_KV_WRITE_OP")) {
-        kv_cpy_ops.push_back(ggml_paged_kv_write_ext(
+        kv_write_dependency = ggml_paged_kv_write_ext(
             ctx, k_cur, v_cur, k_layer, v_layer, block_table_input,
-            position_input, block_size));
+            position_input, block_size);
+        kv_cpy_ops.push_back(kv_write_dependency);
     } else {
         for (int i = 0; i < batch; i++) {
             const auto& table = block_tables[static_cast<size_t>(i)];
@@ -678,9 +680,9 @@ static ggml_tensor* gpu_gqa_forward_paged_batch_decode(
     q = ggml_reshape_4d(ctx, q, head_dim, 1, n_heads, batch);
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    ggml_tensor* attn_out = ggml_paged_attn_ext_v(
-        ctx, q, k_layer, v_layer, block_table_input, kv_lens_input, scale,
-        block_size, max_n_kv, n_kv_heads);
+    ggml_tensor* attn_out = ggml_paged_attn_ext_v_dep(
+        ctx, q, k_layer, v_layer, block_table_input, kv_lens_input,
+        kv_write_dependency, scale, block_size, max_n_kv, n_kv_heads);
     attn_out = ggml_cont(ctx, attn_out);
     attn_out = ggml_reshape_2d(ctx, attn_out, n_heads * head_dim, batch);
     return ggml_mul_mat(ctx, layer.o_proj_w, attn_out);
@@ -769,6 +771,326 @@ ggml_tensor* gpu_llm_forward_paged_batch_decode(
 
     x = gpu_rms_norm(ctx, x, weights.model_norm_w, eps);
     return ggml_mul_mat(ctx, weights.lm_head_w, x);
+}
+
+static ggml_tensor* gpu_gqa_forward_paged_packed(
+    ggml_context* ctx,
+    ggml_tensor* x,
+    const GPULLMLayerWeights& layer,
+    GPUKVCache& cache,
+    int layer_idx,
+    int block_size,
+    int graph_max_n_kv,
+    const std::vector<GPUPackedPrefillLayout>& prefill_layouts,
+    const LLMConfig& cfg,
+    std::vector<ggml_tensor*>& kv_write_ops,
+    const std::vector<ggml_tensor*>& prefill_past_row_inputs,
+    const std::vector<ggml_tensor*>& prefill_mask_inputs,
+    ggml_tensor* block_table_input,
+    ggml_tensor* position_input,
+    ggml_tensor* kv_lens_input
+) {
+    const int packed_tokens = static_cast<int>(x->ne[1]);
+    const int n_heads = cfg.head_count;
+    const int n_kv_heads = cfg.head_count_kv;
+    const int head_dim = cfg.head_dim();
+    const int kv_dim = cfg.kv_dim();
+    const float eps = 1e-5f;
+
+    ggml_tensor* q = ggml_mul_mat(ctx, layer.q_proj_w, x);
+    ggml_tensor* k_cur = ggml_mul_mat(ctx, layer.k_proj_w, x);
+    ggml_tensor* v_cur = ggml_mul_mat(ctx, layer.v_proj_w, x);
+
+    q = ggml_reshape_3d(ctx, q, head_dim, n_heads, packed_tokens);
+    k_cur = ggml_reshape_3d(
+        ctx, k_cur, head_dim, n_kv_heads, packed_tokens);
+    v_cur = ggml_reshape_3d(
+        ctx, v_cur, head_dim, n_kv_heads, packed_tokens);
+
+    q = gpu_rms_norm(ctx, q, layer.q_norm_w, eps);
+    k_cur = gpu_rms_norm(ctx, k_cur, layer.k_norm_w, eps);
+    q = ggml_rope_ext(ctx, q, position_input, nullptr, head_dim, 2, 32768,
+                      cfg.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    k_cur = ggml_rope_ext(
+        ctx, k_cur, position_input, nullptr, head_dim, 2, 32768,
+        cfg.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+    k_cur = ggml_cont(
+        ctx, ggml_reshape_2d(ctx, k_cur, kv_dim, packed_tokens));
+    v_cur = ggml_cont(
+        ctx, ggml_reshape_2d(ctx, v_cur, kv_dim, packed_tokens));
+
+    const size_t k_row_size = ggml_row_size(cache.k->type, kv_dim);
+    const size_t v_row_size = ggml_row_size(cache.v->type, kv_dim);
+    const int physical_rows =
+        cache.physical_rows > 0 ? cache.physical_rows : cache.n_ctx;
+    const size_t k_layer_offset = static_cast<size_t>(layer_idx) *
+                                  physical_rows * k_row_size;
+    const size_t v_layer_offset = static_cast<size_t>(layer_idx) *
+                                  physical_rows * v_row_size;
+    ggml_tensor* k_layer = ggml_view_2d(
+        ctx, cache.k, kv_dim, physical_rows, k_row_size, k_layer_offset);
+    ggml_tensor* v_layer = ggml_view_2d(
+        ctx, cache.v, kv_dim, physical_rows, v_row_size, v_layer_offset);
+
+    ggml_tensor* kv_write = ggml_paged_kv_write_ext(
+        ctx, k_cur, v_cur, k_layer, v_layer,
+        block_table_input, position_input, block_size);
+    kv_write_ops.push_back(kv_write);
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+#ifdef FUNASR_USE_FLASH_ATTN
+    ggml_tensor* packed_attn_out = nullptr;
+    int prefill_tokens = 0;
+    GGML_ASSERT(prefill_past_row_inputs.size() == prefill_layouts.size());
+    GGML_ASSERT(prefill_mask_inputs.size() == prefill_layouts.size());
+
+    for (size_t i = 0; i < prefill_layouts.size(); ++i) {
+        const GPUPackedPrefillLayout& layout = prefill_layouts[i];
+        GGML_ASSERT(layout.row_offset == prefill_tokens);
+        GGML_ASSERT(layout.token_count > 0 && layout.n_past >= 0);
+        GGML_ASSERT(layout.row_offset + layout.token_count <= packed_tokens);
+
+        ggml_tensor* q_seq = ggml_view_3d(
+            ctx, q, head_dim, n_heads, layout.token_count,
+            q->nb[1], q->nb[2],
+            static_cast<size_t>(layout.row_offset) * q->nb[2]);
+        q_seq = ggml_cont(
+            ctx, ggml_permute(ctx, q_seq, 0, 2, 1, 3));
+        q_seq = ggml_reshape_4d(
+            ctx, q_seq, head_dim, layout.token_count, n_heads, 1);
+
+        ggml_tensor* k_seq = ggml_view_2d(
+            ctx, k_cur, kv_dim, layout.token_count, k_cur->nb[1],
+            static_cast<size_t>(layout.row_offset) * k_cur->nb[1]);
+        ggml_tensor* v_seq = ggml_view_2d(
+            ctx, v_cur, kv_dim, layout.token_count, v_cur->nb[1],
+            static_cast<size_t>(layout.row_offset) * v_cur->nb[1]);
+
+        ggml_tensor* k_full = k_seq;
+        ggml_tensor* v_full = v_seq;
+        if (layout.n_past > 0) {
+            GGML_ASSERT(prefill_past_row_inputs[i] != nullptr);
+            ggml_tensor* k_past = ggml_get_rows(
+                ctx, k_layer, prefill_past_row_inputs[i]);
+            ggml_tensor* v_past = ggml_get_rows(
+                ctx, v_layer, prefill_past_row_inputs[i]);
+            k_full = ggml_concat(ctx, k_past, k_seq, 1);
+            v_full = ggml_concat(ctx, v_past, v_seq, 1);
+        }
+
+        const int n_kv = layout.n_past + layout.token_count;
+        k_full = ggml_reshape_3d(
+            ctx, k_full, head_dim, n_kv_heads, n_kv);
+        k_full = ggml_cont(
+            ctx, ggml_permute(ctx, k_full, 0, 2, 1, 3));
+        k_full = ggml_reshape_4d(
+            ctx, k_full, head_dim, n_kv, n_kv_heads, 1);
+
+        v_full = ggml_reshape_3d(
+            ctx, v_full, head_dim, n_kv_heads, n_kv);
+        v_full = ggml_cont(
+            ctx, ggml_permute(ctx, v_full, 0, 2, 1, 3));
+        v_full = ggml_reshape_4d(
+            ctx, v_full, head_dim, n_kv, n_kv_heads, 1);
+
+        GGML_ASSERT(prefill_mask_inputs[i] != nullptr);
+        ggml_tensor* seq_out = ggml_flash_attn_ext(
+            ctx, q_seq, k_full, v_full, prefill_mask_inputs[i],
+            scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(seq_out, GGML_PREC_F32);
+        seq_out = ggml_cont(ctx, seq_out);
+        seq_out = ggml_reshape_2d(
+            ctx, seq_out, n_heads * head_dim, layout.token_count);
+        packed_attn_out = packed_attn_out
+            ? ggml_concat(ctx, packed_attn_out, seq_out, 1)
+            : seq_out;
+        prefill_tokens += layout.token_count;
+    }
+
+    const int decode_tokens = packed_tokens - prefill_tokens;
+    if (decode_tokens > 0) {
+        ggml_tensor* q_decode = ggml_view_3d(
+            ctx, q, head_dim, n_heads, decode_tokens,
+            q->nb[1], q->nb[2],
+            static_cast<size_t>(prefill_tokens) * q->nb[2]);
+        q_decode = ggml_cont(ctx, q_decode);
+        q_decode = ggml_reshape_4d(
+            ctx, q_decode, head_dim, 1, n_heads, decode_tokens);
+
+        ggml_tensor* decode_block_table = ggml_view_2d(
+            ctx, block_table_input, block_table_input->ne[0],
+            decode_tokens, block_table_input->nb[1],
+            static_cast<size_t>(prefill_tokens) * block_table_input->nb[1]);
+        ggml_tensor* decode_kv_lens = ggml_view_1d(
+            ctx, kv_lens_input, decode_tokens,
+            static_cast<size_t>(prefill_tokens) * kv_lens_input->nb[0]);
+        ggml_tensor* decode_out = ggml_paged_attn_ext_v_dep(
+            ctx, q_decode, k_layer, v_layer, decode_block_table,
+            decode_kv_lens, kv_write, scale, block_size,
+            graph_max_n_kv, n_kv_heads);
+        decode_out = ggml_cont(ctx, decode_out);
+        decode_out = ggml_reshape_2d(
+            ctx, decode_out, n_heads * head_dim, decode_tokens);
+        packed_attn_out = packed_attn_out
+            ? ggml_concat(ctx, packed_attn_out, decode_out, 1)
+            : decode_out;
+    }
+    GGML_ASSERT(packed_attn_out != nullptr);
+    return ggml_mul_mat(ctx, layer.o_proj_w, packed_attn_out);
+#else
+    q = ggml_cont(ctx, q);
+    q = ggml_reshape_4d(
+        ctx, q, head_dim, 1, n_heads, packed_tokens);
+    ggml_tensor* attn_out = ggml_paged_attn_ext_v_dep(
+        ctx, q, k_layer, v_layer, block_table_input, kv_lens_input,
+        kv_write, scale, block_size, graph_max_n_kv, n_kv_heads);
+    attn_out = ggml_cont(ctx, attn_out);
+    attn_out = ggml_reshape_2d(
+        ctx, attn_out, n_heads * head_dim, packed_tokens);
+    return ggml_mul_mat(ctx, layer.o_proj_w, attn_out);
+#endif
+}
+
+static ggml_tensor* gpu_llm_layer_forward_paged_packed(
+    ggml_context* ctx,
+    ggml_tensor* x,
+    const GPULLMLayerWeights& layer,
+    GPUKVCache& cache,
+    int layer_idx,
+    int block_size,
+    int graph_max_n_kv,
+    const std::vector<GPUPackedPrefillLayout>& prefill_layouts,
+    const LLMConfig& cfg,
+    std::vector<ggml_tensor*>& kv_write_ops,
+    const std::vector<ggml_tensor*>& prefill_past_row_inputs,
+    const std::vector<ggml_tensor*>& prefill_mask_inputs,
+    ggml_tensor* block_table_input,
+    ggml_tensor* position_input,
+    ggml_tensor* kv_lens_input
+) {
+    const float eps = 1e-5f;
+    ggml_tensor* residual = x;
+    ggml_tensor* x_norm = gpu_rms_norm(
+        ctx, x, layer.input_norm_w, eps);
+    ggml_tensor* attn_out = gpu_gqa_forward_paged_packed(
+        ctx, x_norm, layer, cache, layer_idx, block_size,
+        graph_max_n_kv, prefill_layouts, cfg, kv_write_ops,
+        prefill_past_row_inputs, prefill_mask_inputs,
+        block_table_input, position_input, kv_lens_input);
+    x = ggml_add(ctx, residual, attn_out);
+
+    residual = x;
+    x_norm = gpu_rms_norm(ctx, x, layer.post_attn_norm_w, eps);
+    ggml_tensor* gate = ggml_mul_mat(ctx, layer.gate_proj_w, x_norm);
+    ggml_tensor* up = ggml_mul_mat(ctx, layer.up_proj_w, x_norm);
+    gate = ggml_silu(ctx, gate);
+    ggml_tensor* mlp_out = ggml_mul_mat(
+        ctx, layer.down_proj_w, ggml_mul(ctx, gate, up));
+    return ggml_add(ctx, residual, mlp_out);
+}
+
+ggml_tensor* gpu_llm_forward_paged_packed(
+    ggml_context* ctx,
+    ggml_tensor* hidden_states,
+    const GPULLMWeights& weights,
+    GPUKVCache& cache,
+    int max_blocks,
+    int block_size,
+    int graph_max_n_kv,
+    int selected_row_count,
+    const std::vector<GPUPackedPrefillLayout>& prefill_layouts,
+    const LLMConfig& cfg,
+    std::vector<ggml_tensor*>& kv_write_ops,
+    ggml_tensor** block_table_input,
+    ggml_tensor** position_input,
+    ggml_tensor** kv_lens_input,
+    ggml_tensor** selected_rows_input,
+    std::vector<ggml_tensor*>& prefill_past_row_inputs,
+    std::vector<ggml_tensor*>& prefill_mask_inputs
+) {
+    const int packed_tokens = static_cast<int>(hidden_states->ne[1]);
+    GGML_ASSERT(packed_tokens > 0);
+    GGML_ASSERT(max_blocks > 0);
+    GGML_ASSERT(block_size > 0);
+    GGML_ASSERT(graph_max_n_kv > 0);
+    GGML_ASSERT(selected_row_count >= 0 &&
+                selected_row_count <= packed_tokens);
+
+    ggml_tensor* block_ids = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I32, max_blocks, packed_tokens);
+    ggml_set_name(block_ids, "packed_paged_block_table");
+    ggml_set_input(block_ids);
+    *block_table_input = block_ids;
+
+    ggml_tensor* positions = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_I32, packed_tokens);
+    ggml_set_name(positions, "packed_paged_positions");
+    ggml_set_input(positions);
+    *position_input = positions;
+
+    ggml_tensor* kv_lens = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_I32, packed_tokens);
+    ggml_set_name(kv_lens, "packed_paged_kv_lens");
+    ggml_set_input(kv_lens);
+    *kv_lens_input = kv_lens;
+
+    ggml_tensor* selected_rows = nullptr;
+    if (selected_row_count > 0) {
+        selected_rows = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_I32, selected_row_count);
+        ggml_set_name(selected_rows, "packed_selected_rows");
+        ggml_set_input(selected_rows);
+    }
+    *selected_rows_input = selected_rows;
+
+#ifdef FUNASR_USE_FLASH_ATTN
+    prefill_past_row_inputs.clear();
+    prefill_mask_inputs.clear();
+    prefill_past_row_inputs.reserve(prefill_layouts.size());
+    prefill_mask_inputs.reserve(prefill_layouts.size());
+    for (const GPUPackedPrefillLayout& layout : prefill_layouts) {
+        GGML_ASSERT(layout.row_offset >= 0 && layout.token_count > 0 &&
+                    layout.n_past >= 0 &&
+                    layout.row_offset + layout.token_count <= packed_tokens);
+        ggml_tensor* past_rows = nullptr;
+        if (layout.n_past > 0) {
+            past_rows = ggml_new_tensor_1d(
+                ctx, GGML_TYPE_I32, layout.n_past);
+            ggml_set_name(past_rows, "packed_prefill_past_rows");
+            ggml_set_input(past_rows);
+        }
+        ggml_tensor* mask = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F16,
+            layout.n_past + layout.token_count,
+            layout.token_count);
+        ggml_set_name(mask, "packed_prefill_mask");
+        ggml_set_input(mask);
+        prefill_past_row_inputs.push_back(past_rows);
+        prefill_mask_inputs.push_back(mask);
+    }
+#else
+    (void)prefill_layouts;
+    prefill_past_row_inputs.clear();
+    prefill_mask_inputs.clear();
+#endif
+
+    ggml_tensor* x = hidden_states;
+    for (int i = 0; i < cfg.block_count; ++i) {
+        x = gpu_llm_layer_forward_paged_packed(
+            ctx, x, weights.layers[static_cast<size_t>(i)], cache, i,
+            block_size, graph_max_n_kv, prefill_layouts, cfg, kv_write_ops,
+            prefill_past_row_inputs, prefill_mask_inputs,
+            block_ids, positions, kv_lens);
+    }
+
+    if (selected_rows) {
+        x = ggml_get_rows(ctx, x, selected_rows);
+        x = gpu_rms_norm(ctx, x, weights.model_norm_w, 1e-5f);
+        return ggml_mul_mat(ctx, weights.lm_head_w, x);
+    }
+    return x;
 }
 
 } // namespace funasr

@@ -37,6 +37,22 @@ void add_audio_chunk(std::vector<AudioChunk>& chunks,
 
 } // namespace
 
+float selected_audio_duration_seconds(
+    const std::vector<AudioChunk>& chunks,
+    int sample_rate) {
+    if (sample_rate <= 0) {
+        return 0.0f;
+    }
+
+    size_t selected_samples = 0;
+    for (const auto& chunk : chunks) {
+        if (chunk.end_sample > chunk.start_sample) {
+            selected_samples += chunk.end_sample - chunk.start_sample;
+        }
+    }
+    return static_cast<float>(selected_samples) / static_cast<float>(sample_rate);
+}
+
 std::vector<AudioChunk> split_audio_by_window(
     const std::vector<float>& samples,
     int sample_rate,

@@ -8,6 +8,9 @@
 #include "pipeline/offline_batching.hpp"
 #include "compute/silero_vad.hpp"
 #include "miniaudio.h"
+#ifdef FUNASR_USE_CUDA
+#include <ggml-cuda.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -21,6 +24,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -81,10 +85,25 @@ struct Options {
     bool offline_scheduler = false;
     bool offline_profile = false;
     bool offline_paged_opts = true;
+    bool prefix_kv_cache = false;
+    bool dynamic_kv_blocks = false;
+    bool unified_scheduler = false;
+    int max_scheduled_tokens = 1024;
+    int max_prefill_chunk_tokens = 512;
+    int max_frontend_requests_per_step = 4;
+    bool frontend_batching = true;
+    bool frontend_prefetch = true;
+    bool gpu_frontend_overlap = false;
+    int frontend_bucket_window = 16;
+    int mixed_graph_cache_entries = 8;
+    bool offline_auto_tune = false;
     int offline_batch_size = 12;
     OfflineKVMode offline_kv_mode = OfflineKVMode::Continuous;
     int offline_kv_block_size = 64;
     int offline_kv_num_blocks = 0;
+    bool offline_batch_size_set = false;
+    bool offline_kv_num_blocks_set = false;
+    bool max_frontend_requests_set = false;
 
     bool help = false;
 };
@@ -178,8 +197,20 @@ void print_usage(const char* argv0) {
         "Offline scheduler:\n"
         "  --offline-scheduler    Use continuous offline scheduler for chunked audio\n"
         "  --offline-profile      Print scheduler and paged decode profile lines\n"
-        "  --offline-preset <n>   Preset: long-video\n"
+        "  --offline-preset <n>   Preset: long-video, long-video-legacy\n"
         "  --no-offline-paged-opts Disable default paged decode optimization env flags\n"
+        "  --prefix-kv-cache <on|off> Reuse task ChatML prefix KV (default: off)\n"
+        "  --dynamic-kv-blocks <on|off> Append paged KV blocks on demand (default: off)\n"
+        "  --unified-scheduler <on|off> Share a token budget across prefill and decode (default: off)\n"
+        "  --max-scheduled-tokens <n> Unified scheduler token budget per step (default: 1024)\n"
+        "  --max-prefill-chunk-tokens <n> Max prompt tokens per request per step (default: 512)\n"
+        "  --max-frontend-requests <n> Max new requests prepared per step (default: 4)\n"
+        "  --frontend-batching <on|off> Batch Encoder/Adaptor requests (default: on)\n"
+        "  --frontend-prefetch <on|off> Overlap CPU Fbank with mixed LLM work (default: on)\n"
+        "  --gpu-frontend-overlap <on|off> Experimental Encoder/Adaptor stream overlap (default: off)\n"
+        "  --frontend-bucket-window <n> Length-sort lookahead window (default: 16)\n"
+        "  --mixed-graph-cache-entries <n> Mixed CUDA Graph LRU entries (default: 8)\n"
+        "  --offline-auto-tune <on|off> Tune batch/KV pool from GPU memory (default: off)\n"
         "  --batch-size <n>       Offline scheduler active request limit (default: 12)\n"
         "  --kv-mode <mode>       Offline KV mode: continuous, paged (default: continuous)\n"
         "  --kv-block-size <n>    Paged KV block size (default: 64)\n"
@@ -300,15 +331,28 @@ bool parse_offline_kv_mode(const std::string& value, OfflineKVMode& out) {
     return false;
 }
 
+bool parse_on_off(const std::string& value, bool& out) {
+    const std::string mode = to_lower(value);
+    if (mode == "on") {
+        out = true;
+        return true;
+    }
+    if (mode == "off") {
+        out = false;
+        return true;
+    }
+    return false;
+}
+
 bool apply_offline_preset(const std::string& value, Options& opt) {
     std::string preset = to_lower(value);
-    if (preset != "long-video") {
+    if (preset != "long-video" && preset != "long-video-legacy") {
         return false;
     }
 
     opt.offline_scheduler = true;
     opt.offline_profile = true;
-    opt.offline_batch_size = 12;
+    opt.offline_batch_size = preset == "long-video" ? 40 : 12;
     opt.offline_kv_mode = OfflineKVMode::Paged;
     opt.offline_kv_block_size = 128;
     opt.ctx_size = 4096;
@@ -316,6 +360,22 @@ bool apply_offline_preset(const std::string& value, Options& opt) {
     opt.chunk_mode_set = true;
     opt.chunk_sec = 30;
     opt.max_tokens = 220;
+    opt.prefix_kv_cache = preset == "long-video";
+    opt.dynamic_kv_blocks = true;
+    opt.unified_scheduler = preset == "long-video";
+    opt.offline_kv_num_blocks = preset == "long-video" ? 192 : 0;
+    opt.max_scheduled_tokens = 1024;
+    opt.max_prefill_chunk_tokens = 512;
+    opt.max_frontend_requests_per_step = 4;
+    opt.frontend_batching = true;
+    opt.frontend_prefetch = preset == "long-video";
+    opt.gpu_frontend_overlap = false;
+    opt.frontend_bucket_window = preset == "long-video" ? 32 : 4;
+    opt.mixed_graph_cache_entries = preset == "long-video" ? 16 : 1;
+    opt.offline_auto_tune = preset == "long-video";
+    opt.offline_batch_size_set = false;
+    opt.offline_kv_num_blocks_set = false;
+    opt.max_frontend_requests_set = false;
     return true;
 }
 
@@ -355,6 +415,19 @@ int gpu_init_slots(const Options& opt) {
     return 1;
 }
 
+int gpu_init_prompt_slots(const Options& opt) {
+    const int active_slots = gpu_init_slots(opt);
+    if (!opt.unified_scheduler || !opt.offline_scheduler ||
+        opt.chunk_mode == ChunkMode::None) {
+        return active_slots;
+    }
+    const int extra = std::max(1, opt.max_frontend_requests_per_step);
+    if (active_slots > std::numeric_limits<int>::max() - extra) {
+        return std::numeric_limits<int>::max();
+    }
+    return active_slots + extra;
+}
+
 funasr::OfflineBatchConfig make_offline_batch_config(const Options& opt) {
     funasr::OfflineBatchConfig cfg;
     cfg.batch_size = opt.offline_batch_size;
@@ -366,7 +439,87 @@ funasr::OfflineBatchConfig make_offline_batch_config(const Options& opt) {
     cfg.use_paged_kv = opt.offline_kv_mode == OfflineKVMode::Paged;
     cfg.kv_block_size = opt.offline_kv_block_size;
     cfg.kv_num_blocks = opt.offline_kv_num_blocks;
+    cfg.enable_prefix_kv_cache = cfg.use_paged_kv && opt.prefix_kv_cache;
+    cfg.enable_dynamic_kv_blocks = cfg.use_paged_kv && opt.dynamic_kv_blocks;
+    cfg.use_unified_scheduler = opt.unified_scheduler;
+    cfg.max_num_scheduled_tokens = opt.max_scheduled_tokens;
+    cfg.max_prefill_chunk_tokens = opt.max_prefill_chunk_tokens;
+    cfg.max_frontend_requests_per_step =
+        opt.max_frontend_requests_per_step;
+    cfg.enable_frontend_batching = opt.frontend_batching;
+    cfg.enable_frontend_prefetch = opt.frontend_prefetch;
+    cfg.enable_gpu_frontend_overlap = opt.gpu_frontend_overlap;
+    cfg.frontend_bucket_window = opt.frontend_bucket_window;
+    cfg.mixed_graph_cache_entries = opt.mixed_graph_cache_entries;
     return cfg;
+}
+
+void apply_runtime_auto_tune(Options& opt,
+                             const funasr::ModelConfig& model_config) {
+    if (!opt.offline_auto_tune || !opt.use_gpu ||
+        opt.offline_kv_mode != OfflineKVMode::Paged) {
+        return;
+    }
+#ifdef FUNASR_USE_CUDA
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    ggml_backend_cuda_get_device_memory(
+        opt.gpu_id, &free_bytes, &total_bytes);
+    std::error_code error;
+    const uint64_t model_bytes = fs::file_size(opt.model_path, error);
+    const uint64_t kv_bytes_per_block =
+        static_cast<uint64_t>(std::max(1, opt.offline_kv_block_size)) *
+        static_cast<uint64_t>(std::max(1, model_config.llm.block_count)) *
+        static_cast<uint64_t>(std::max(1, model_config.llm.kv_dim())) *
+        2ULL * sizeof(ggml_fp16_t);
+
+    funasr::OfflineAutoTuneInput input;
+    input.gpu_free_bytes = free_bytes;
+    input.gpu_total_bytes = total_bytes;
+    input.model_file_bytes = error ? 0 : model_bytes;
+    input.kv_bytes_per_block = kv_bytes_per_block;
+    input.chunk_seconds = opt.chunk_sec;
+    input.max_tokens = opt.max_tokens;
+    input.block_size = opt.offline_kv_block_size;
+    const funasr::OfflineAutoTuneResult tuned =
+        funasr::tune_offline_runtime(input);
+    if (!tuned.used_memory_probe) {
+        std::fprintf(stderr,
+                     "[OfflineAutoTune] memory probe unavailable; using preset values\n");
+        return;
+    }
+    if (!opt.offline_batch_size_set) {
+        opt.offline_batch_size = tuned.batch_size;
+    }
+    if (!opt.offline_kv_num_blocks_set) {
+        opt.offline_kv_num_blocks = tuned.kv_num_blocks;
+    }
+    if (!opt.max_frontend_requests_set) {
+        opt.max_frontend_requests_per_step =
+            tuned.max_frontend_requests;
+    }
+    std::fprintf(stderr,
+                 "[OfflineAutoTune] gpu=%.2f/%.2fGiB batch=%d blocks=%d "
+                 "frontend=%d block_size=%d\n",
+                 free_bytes / 1073741824.0,
+                 total_bytes / 1073741824.0,
+                 opt.offline_batch_size,
+                 opt.offline_kv_num_blocks,
+                 opt.max_frontend_requests_per_step,
+                 opt.offline_kv_block_size);
+#else
+    (void)model_config;
+#endif
+}
+
+int gpu_init_physical_kv_rows(const Options& opt) {
+    if (!opt.use_gpu || !opt.offline_scheduler ||
+        opt.chunk_mode == ChunkMode::None ||
+        opt.offline_kv_mode != OfflineKVMode::Paged) {
+        return 0;
+    }
+    return funasr::resolve_paged_kv_physical_rows(
+        make_offline_batch_config(opt));
 }
 
 void apply_offline_paged_env_defaults(const Options& opt) {
@@ -532,10 +685,87 @@ bool parse_args(int argc, char* argv[], Options& opt) {
             opt.offline_profile = true;
         } else if (arg == "--no-offline-paged-opts") {
             opt.offline_paged_opts = false;
+        } else if (arg == "--prefix-kv-cache") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_on_off(value, opt.prefix_kv_cache)) {
+                std::fprintf(stderr, "Invalid --prefix-kv-cache value: use on or off\n");
+                return false;
+            }
+        } else if (arg == "--dynamic-kv-blocks") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_on_off(value, opt.dynamic_kv_blocks)) {
+                std::fprintf(stderr, "Invalid --dynamic-kv-blocks value: use on or off\n");
+                return false;
+            }
+        } else if (arg == "--unified-scheduler") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_on_off(value, opt.unified_scheduler)) {
+                std::fprintf(stderr, "Invalid --unified-scheduler value: use on or off\n");
+                return false;
+            }
+        } else if (arg == "--max-scheduled-tokens") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_positive_int(value, opt.max_scheduled_tokens)) {
+                std::fprintf(stderr, "Invalid --max-scheduled-tokens value\n");
+                return false;
+            }
+        } else if (arg == "--max-prefill-chunk-tokens") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_positive_int(value, opt.max_prefill_chunk_tokens)) {
+                std::fprintf(stderr, "Invalid --max-prefill-chunk-tokens value\n");
+                return false;
+            }
+        } else if (arg == "--max-frontend-requests") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_positive_int(
+                    value, opt.max_frontend_requests_per_step)) {
+                std::fprintf(stderr, "Invalid --max-frontend-requests value\n");
+                return false;
+            }
+            opt.max_frontend_requests_set = true;
+        } else if (arg == "--frontend-batching") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_on_off(value, opt.frontend_batching)) {
+                std::fprintf(stderr, "Invalid --frontend-batching value: use on or off\n");
+                return false;
+            }
+        } else if (arg == "--frontend-prefetch") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_on_off(value, opt.frontend_prefetch)) {
+                std::fprintf(stderr, "Invalid --frontend-prefetch value: use on or off\n");
+                return false;
+            }
+        } else if (arg == "--gpu-frontend-overlap") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_on_off(value, opt.gpu_frontend_overlap)) {
+                std::fprintf(stderr, "Invalid --gpu-frontend-overlap value: use on or off\n");
+                return false;
+            }
+        } else if (arg == "--frontend-bucket-window") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_positive_int(
+                    value, opt.frontend_bucket_window)) {
+                std::fprintf(stderr, "Invalid --frontend-bucket-window value\n");
+                return false;
+            }
+        } else if (arg == "--mixed-graph-cache-entries") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_positive_int(
+                    value, opt.mixed_graph_cache_entries) ||
+                opt.mixed_graph_cache_entries > 64) {
+                std::fprintf(stderr, "Invalid --mixed-graph-cache-entries value (1..64)\n");
+                return false;
+            }
+        } else if (arg == "--offline-auto-tune") {
+            const char* value = need_value(arg.c_str());
+            if (!value || !parse_on_off(value, opt.offline_auto_tune)) {
+                std::fprintf(stderr, "Invalid --offline-auto-tune value: use on or off\n");
+                return false;
+            }
         } else if (arg == "--offline-preset") {
             const char* value = need_value(arg.c_str());
             if (!value || !apply_offline_preset(value, opt)) {
-                std::fprintf(stderr, "Invalid --offline-preset value: use long-video\n");
+                std::fprintf(stderr, "Invalid --offline-preset value: use long-video or long-video-legacy\n");
                 return false;
             }
         } else if (arg == "--batch-size") {
@@ -544,6 +774,7 @@ bool parse_args(int argc, char* argv[], Options& opt) {
                 std::fprintf(stderr, "Invalid --batch-size value\n");
                 return false;
             }
+            opt.offline_batch_size_set = true;
         } else if (arg == "--kv-mode") {
             const char* value = need_value(arg.c_str());
             if (!value || !parse_offline_kv_mode(value, opt.offline_kv_mode)) {
@@ -562,6 +793,7 @@ bool parse_args(int argc, char* argv[], Options& opt) {
                 std::fprintf(stderr, "Invalid --kv-num-blocks value\n");
                 return false;
             }
+            opt.offline_kv_num_blocks_set = true;
         } else {
             std::fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
             return false;
@@ -1099,6 +1331,66 @@ void print_offline_profile(const funasr::OfflineBatchStats& stats,
                  stats.average_decode_dispatch_ms(),
                  stats.scheduler_idle_steps);
 
+    if (stats.unified_steps > 0) {
+        const long long graph_calls = stats.unified_graph_cache_hits +
+                                      stats.unified_graph_cache_misses;
+        std::fprintf(stderr,
+                     "[OfflineCLI] unified_profile: steps=%d mixed=%d "
+                     "prefill_only=%d decode_only=%d tokens=%lld "
+                     "compute=%.2fms graph=%lld/%lld hit_rate=%.2f%% "
+                     "entries=%d/%d evictions=%lld shapes=%zu\n",
+                     stats.unified_steps,
+                     stats.unified_mixed_steps,
+                     stats.unified_prefill_only_steps,
+                     stats.unified_decode_only_steps,
+                     stats.unified_scheduled_tokens,
+                     stats.unified_compute_ms,
+                     stats.unified_graph_cache_hits,
+                     graph_calls,
+                     graph_calls > 0
+                         ? 100.0 * stats.unified_graph_cache_hits / graph_calls
+                         : 0.0,
+                     stats.unified_graph_cache_entries_peak,
+                     stats.unified_graph_cache_capacity,
+                     stats.unified_graph_cache_evictions,
+                     stats.unified_graph_shapes.size());
+        std::fprintf(stderr,
+                     "[OfflineCLI] frontend_pipeline: batches=%d requests=%d "
+                     "prefetch=%d ready=%d wait=%.2fms fbank=%.2fms "
+                     "gpu_wall=%.2fms padding=%lld/%lld\n",
+                     stats.frontend_batch_calls,
+                     stats.frontend_batched_requests,
+                     stats.frontend_prefetch_launches,
+                     stats.frontend_prefetch_ready_hits,
+                     stats.frontend_prefetch_wait_ms,
+                     stats.frontend_fbank_ms,
+                     stats.frontend_batch_wall_ms,
+                     stats.frontend_padded_frames,
+                     stats.frontend_input_frames +
+                         stats.frontend_padded_frames);
+
+        std::vector<funasr::OfflineMixedGraphShapeStat> graph_shapes;
+        graph_shapes.reserve(stats.unified_graph_shapes.size());
+        for (const auto& item : stats.unified_graph_shapes) {
+            graph_shapes.push_back(item.second);
+        }
+        std::sort(graph_shapes.begin(), graph_shapes.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                      return lhs.calls > rhs.calls;
+                  });
+        for (size_t i = 0; i < std::min<size_t>(5, graph_shapes.size()); ++i) {
+            const auto& shape = graph_shapes[i];
+            std::fprintf(stderr,
+                         "[OfflineCLI] mixed_graph_shape: rank=%zu calls=%lld "
+                         "prefill=%d decode=%d total=%d prefill_seqs=%d "
+                         "max_blocks=%d max_n_kv=%d\n",
+                         i + 1, shape.calls, shape.prefill_tokens,
+                         shape.decode_tokens, shape.total_tokens,
+                         shape.prefill_sequences, shape.max_blocks,
+                         shape.max_n_kv);
+        }
+    }
+
     if (!(opt.use_gpu && stats.use_paged_kv)) {
         return;
     }
@@ -1213,11 +1505,17 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    apply_runtime_auto_tune(opt, recognizer.config());
+
     if (opt.use_gpu) {
         std::fprintf(stderr, "[2] Initializing GPU device %d...\n", opt.gpu_id);
         int gpu_slots = gpu_init_slots(opt);
+        int physical_kv_rows = gpu_init_physical_kv_rows(opt);
+        const int prompt_slots = gpu_init_prompt_slots(opt);
         ScopedStdoutToStderr redirect;
-        if (!recognizer.init_gpu(opt.ctx_size, opt.gpu_id, gpu_slots)) {
+        if (!recognizer.init_gpu(
+                opt.ctx_size, opt.gpu_id, gpu_slots, physical_kv_rows,
+                prompt_slots, opt.gpu_frontend_overlap)) {
             std::fprintf(stderr, "Warning: GPU init failed, falling back to CPU\n");
             opt.use_gpu = false;
         }

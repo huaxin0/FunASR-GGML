@@ -88,6 +88,20 @@ ggml_tensor* encoder_forward(
     const EncoderConfig& cfg
 );
 
+// Batched GPU frontend path.
+// x:              [input_dim, max_frames, batch]
+// attention_mask: [max_frames, max_frames, 1, batch], F16, 0/-inf
+// valid_mask:     [1, max_frames, batch], F32, 1 for valid frames
+// output:          [output_dim, max_frames, batch]
+ggml_tensor* encoder_forward_batched(
+    ggml_context* ctx,
+    ggml_tensor* x,
+    ggml_tensor* attention_mask,
+    ggml_tensor* valid_mask,
+    const EncoderWeights& weights,
+    const EncoderConfig& cfg
+);
+
 } // namespace funasr
 
 #endif // FUNASR_COMPUTE_ENCODER_OPS_HPP

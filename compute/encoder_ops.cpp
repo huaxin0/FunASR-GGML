@@ -211,6 +211,56 @@ ggml_tensor* sanm_attention_forward(
     return ggml_add(ctx, attn_out, fsmn_mem);
 }
 
+static ggml_tensor* sanm_attention_forward_batched(
+    ggml_context* ctx,
+    ggml_tensor* x,
+    ggml_tensor* attention_mask,
+    ggml_tensor* valid_mask,
+    const EncoderLayerWeights& layer,
+    const EncoderConfig& cfg
+) {
+    const int T = static_cast<int>(x->ne[1]);
+    const int batch = static_cast<int>(x->ne[2]);
+    const int n_heads = cfg.attention_heads;
+
+    ggml_tensor* q = linear_with_bias(ctx, x, layer.attn_q_w, layer.attn_q_b);
+    ggml_tensor* k = linear_with_bias(ctx, x, layer.attn_k_w, layer.attn_k_b);
+    ggml_tensor* v = linear_with_bias(ctx, x, layer.attn_v_w, layer.attn_v_b);
+
+    // Bias terms make padded rows non-zero. Zero V before FSMN so valid frames
+    // keep the same boundary condition as an independently executed sequence.
+    ggml_tensor* masked_v = ggml_mul(ctx, v, valid_mask);
+    ggml_tensor* fsmn_mem = fsmn_forward(
+        ctx, masked_v, layer.fsmn_w, cfg.kernel_size, cfg.fsmn_pad());
+
+    const int qk_dim = static_cast<int>(q->ne[0]);
+    const int head_dim = qk_dim / n_heads;
+    const int v_dim = static_cast<int>(v->ne[0]);
+    const int v_head_dim = v_dim / n_heads;
+
+    q = ggml_reshape_4d(ctx, q, head_dim, n_heads, T, batch);
+    q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+    k = ggml_reshape_4d(ctx, k, head_dim, n_heads, T, batch);
+    k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+    ggml_tensor* v_4d = ggml_reshape_4d(
+        ctx, v, v_head_dim, n_heads, T, batch);
+    ggml_tensor* v_perm = ggml_cont(
+        ctx, ggml_permute(ctx, v_4d, 1, 2, 0, 3));
+
+    q = ggml_scale(
+        ctx, q, 1.0f / std::sqrt(static_cast<float>(head_dim)));
+    ggml_tensor* scores = ggml_mul_mat(ctx, k, q);
+    ggml_tensor* attn = ggml_soft_max_ext(
+        ctx, scores, attention_mask, 1.0f, 0.0f);
+    ggml_tensor* attn_out = ggml_mul_mat(ctx, v_perm, attn);
+    attn_out = ggml_cont(
+        ctx, ggml_permute(ctx, attn_out, 0, 2, 1, 3));
+    attn_out = ggml_reshape_3d(ctx, attn_out, v_dim, T, batch);
+    attn_out = linear_with_bias(
+        ctx, attn_out, layer.attn_out_w, layer.attn_out_b);
+    return ggml_add(ctx, attn_out, fsmn_mem);
+}
+
 // ============================================================
 // 单层 Encoder 前向传播
 //
@@ -302,6 +352,57 @@ ggml_tensor* encoder_forward(
     x = layer_norm(ctx, x, weights.tp_norm_w, weights.tp_norm_b);
 
     return x;
+}
+
+ggml_tensor* encoder_forward_batched(
+    ggml_context* ctx,
+    ggml_tensor* x,
+    ggml_tensor* attention_mask,
+    ggml_tensor* valid_mask,
+    const EncoderWeights& weights,
+    const EncoderConfig& cfg
+) {
+    GGML_ASSERT(ctx && x && attention_mask && valid_mask);
+    GGML_ASSERT(x->ne[1] == attention_mask->ne[0]);
+    GGML_ASSERT(x->ne[1] == attention_mask->ne[1]);
+    GGML_ASSERT(x->ne[2] == attention_mask->ne[3]);
+    GGML_ASSERT(valid_mask->ne[0] == 1);
+    GGML_ASSERT(valid_mask->ne[1] == x->ne[1]);
+    GGML_ASSERT(valid_mask->ne[2] == x->ne[2]);
+
+    x = ggml_scale(ctx, x, std::sqrt(static_cast<float>(cfg.output_size)));
+
+    auto layer_forward = [&](ggml_tensor* input,
+                             const EncoderLayerWeights& layer,
+                             bool has_attention_residual) {
+        ggml_tensor* residual = input;
+        ggml_tensor* normalized = layer_norm(
+            ctx, input, layer.norm1_w, layer.norm1_b);
+        ggml_tensor* attention = sanm_attention_forward_batched(
+            ctx, normalized, attention_mask, valid_mask, layer, cfg);
+        ggml_tensor* output = has_attention_residual
+            ? ggml_add(ctx, residual, attention)
+            : attention;
+
+        residual = output;
+        normalized = layer_norm(
+            ctx, output, layer.norm2_w, layer.norm2_b);
+        ggml_tensor* ffn = linear_with_bias(
+            ctx, normalized, layer.ffn_w1, layer.ffn_b1);
+        ffn = ggml_relu(ctx, ffn);
+        ffn = linear_with_bias(ctx, ffn, layer.ffn_w2, layer.ffn_b2);
+        return ggml_add(ctx, residual, ffn);
+    };
+
+    x = layer_forward(x, weights.encoder0, false);
+    for (int i = 0; i < cfg.num_main_blocks(); ++i) {
+        x = layer_forward(x, weights.main_layers[i], true);
+    }
+    x = layer_norm(ctx, x, weights.after_norm_w, weights.after_norm_b);
+    for (int i = 0; i < cfg.tp_blocks; ++i) {
+        x = layer_forward(x, weights.tp_layers[i], true);
+    }
+    return layer_norm(ctx, x, weights.tp_norm_w, weights.tp_norm_b);
 }
 
 } // namespace funasr

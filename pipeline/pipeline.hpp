@@ -16,9 +16,12 @@
 #include "compute/fbank.hpp"
 #include "compute/gpu_profile.hpp"
 #include "compute/kv_cache.hpp"
+#include "pipeline/gpu_prompt.hpp"
+#include "pipeline/mixed_batch.hpp"
 #include "pipeline/prompt_builder.hpp"
 #ifdef FUNASR_USE_CUDA
 #include "compute/gpu_context.hpp"
+#include "compute/gpu_mixed_runner.hpp"
 #include "compute/gpu_runner.hpp"
 #include "compute/encoder_adaptor_gpu.hpp"
 #endif
@@ -64,6 +67,23 @@ struct AudioSpan {
     size_t n_samples = 0;
 };
 
+struct FbankBatchItem {
+    std::vector<float> data;
+    int frames = 0;
+    int dim = 0;
+    bool ok = false;
+};
+
+struct PreparedFbankBatch {
+    std::vector<AudioSpan> audio;
+    std::vector<int> request_ids;
+    std::vector<FbankBatchItem> items;
+    long fbank_ms = 0;
+    long long input_frames = 0;
+    long long padded_frames = 0;
+    bool ok = false;
+};
+
 struct GPUPrefillState {
     int request_id = -1;
     int slot_id = -1;
@@ -72,6 +92,16 @@ struct GPUPrefillState {
     std::vector<int> block_table;
     std::vector<float> logits;
     InferenceResult stats;
+    bool ok = false;
+};
+
+// Non-owning view of the GPU encoder/adaptor staging output. Consume it before
+// the next frontend invocation, which reuses the same backing storage.
+struct PreparedGPUAudio {
+    ggml_tensor* adaptor_tensor = nullptr;
+    int request_id = -1;
+    int audio_frames = 0;
+    float encoder_ms = 0.0f;
     bool ok = false;
 };
 
@@ -100,6 +130,34 @@ struct GPUDecodeDispatchStats {
     int invalid_paged_input = 0;
 };
 
+struct GPUMixedStepInput {
+    PackedSequenceSource source;
+    GPUEmbeddingHandle prompt_embeddings;
+};
+
+struct GPUMixedStepOutput {
+    int request_id = -1;
+    int next_token = -1;
+};
+
+struct GPUMixedStepResult {
+    std::vector<GPUMixedStepOutput> outputs;
+    int total_tokens = 0;
+    int prefill_tokens = 0;
+    int decode_tokens = 0;
+    float staging_ms = 0.0f;
+    float compute_ms = 0.0f;
+    bool graph_cache_hit = false;
+    uint64_t graph_shape_hash = 0;
+    int graph_max_blocks = 0;
+    int graph_max_n_kv = 0;
+    int graph_prefill_sequences = 0;
+    int graph_cache_entries = 0;
+    int graph_cache_capacity = 0;
+    uint64_t graph_cache_evictions = 0;
+    bool ok = false;
+};
+
 // 推理配置
 struct InferenceConfig {
     int max_new_tokens = 100;       // 最大生成 token 数
@@ -125,7 +183,9 @@ public:
     // GPU 初始化（可选，只在 use_gpu=true 时需要）
     // 必须在第一次 run() 之前调用
     // ============================================================
-    bool init_gpu(int n_ctx = 2048, int gpu_id = 0, int n_slots = 1);
+    bool init_gpu(int n_ctx = 2048, int gpu_id = 0, int n_slots = 1,
+                  int physical_kv_rows = 0, int prompt_slots = 0,
+                  bool enable_frontend_overlap = false);
     bool is_gpu_ready() const;
 
     // ============================================================
@@ -178,13 +238,97 @@ public:
         const InferenceConfig& config = InferenceConfig()
     );
 
+    PreparedGPUAudio prepare_audio_gpu(
+        const AudioSpan& audio,
+        int request_id
+    );
+
+    PreparedGPUPrompt prepare_prompt_gpu(
+        AudioSpan audio,
+        int request_id,
+        int cached_prefix_tokens,
+        const InferenceConfig& config = InferenceConfig()
+    );
+
+    std::vector<PreparedGPUPrompt> prepare_prompts_gpu_batch(
+        const std::vector<AudioSpan>& audio,
+        const std::vector<int>& request_ids,
+        int cached_prefix_tokens,
+        const InferenceConfig& config = InferenceConfig()
+    );
+
+    PreparedFbankBatch prepare_fbank_batch(
+        const std::vector<AudioSpan>& audio,
+        const std::vector<int>& request_ids,
+        int n_threads
+    );
+
+    std::vector<PreparedGPUPrompt> prepare_prompts_gpu_batch_from_fbank(
+        const PreparedFbankBatch& fbank_batch,
+        int cached_prefix_tokens,
+        const InferenceConfig& config = InferenceConfig()
+    );
+
+    bool release_prompt_gpu(const GPUEmbeddingHandle& handle);
+    bool reserve_prompt_embedding_slots(int min_capacity);
+    int free_prompt_embedding_slots() const;
+    int prompt_embedding_capacity() const;
+    bool supports_gpu_frontend_overlap() const;
+    void synchronize_gpu_frontend();
+    bool configure_mixed_graph_cache(int capacity);
+
+    GPUPrefillState gpu_prefill_prompt_chunk_paged(
+        const PreparedGPUPrompt& prepared,
+        int absolute_token_offset,
+        int requested_tokens,
+        const std::vector<int>& block_table,
+        int block_size,
+        const InferenceConfig& config = InferenceConfig()
+    );
+
+    GPUPrefillState gpu_prefill_prefix_paged(
+        const std::vector<int>& prefix_ids,
+        int request_id,
+        const std::vector<int>& block_table,
+        int block_size,
+        const InferenceConfig& config = InferenceConfig()
+    );
+
+    GPUPrefillState gpu_prefill_prepared_audio_paged(
+        const PreparedGPUAudio& prepared,
+        int request_id,
+        const std::vector<int>& block_table,
+        int block_size,
+        int cached_prefix_tokens,
+        const InferenceConfig& config = InferenceConfig()
+    );
+
+    bool copy_paged_kv_block_rows(
+        int source_block,
+        int destination_block,
+        int valid_rows,
+        int block_size
+    );
+
     std::vector<GPUDecodeStepOutput> gpu_decode_step_slots(
         const std::vector<GPUDecodeStepInput>& inputs,
         const InferenceConfig& config = InferenceConfig(),
         GPUDecodeDispatchStats* dispatch_stats = nullptr
     );
 
+    GPUMixedStepResult gpu_mixed_step_paged(
+        const std::vector<GPUMixedStepInput>& inputs,
+        int block_size,
+        const InferenceConfig& config = InferenceConfig());
+
     PagedDecodeProfile gpu_paged_decode_profile() const;
+
+    std::vector<int> prompt_prefix_ids(const PromptOptions& options) const {
+        return prompt_builder_.prefix_ids(options);
+    }
+    std::vector<int> prompt_suffix_ids(const PromptOptions& options) const {
+        return prompt_builder_.suffix_ids(options);
+    }
 
     // ============================================================
     // 便捷接口：从 WAV 文件推理
@@ -244,7 +388,11 @@ private:
 #ifdef FUNASR_USE_CUDA
     std::unique_ptr<GPUContext> gpu_ctx_;
     std::unique_ptr<GPURunner>  gpu_runner_;
+    ggml_backend_t gpu_frontend_backend_ = nullptr;
     std::unique_ptr<GPUEncoderAdaptorRunner> gpu_ea_runner_;
+    // Declared after gpu_ctx_: reverse member destruction releases pool first.
+    std::unique_ptr<GPUEmbeddingPool> gpu_prompt_pool_;
+    std::unique_ptr<GPUMixedRunner> gpu_mixed_runner_;
 
     // Prefill staging: 持久化的 GPU tensor 用于拼接 inputs_embeds
     // 避免每次推理都 alloc/free

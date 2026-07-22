@@ -1,0 +1,1292 @@
+diff --git a/include/ggml-alloc.h b/include/ggml-alloc.h
+index 78aa059d..d9359fe5 100644
+--- a/include/ggml-alloc.h
++++ b/include/ggml-alloc.h
+@@ -71,6 +71,11 @@ GGML_API bool ggml_gallocr_reserve_n(
+ // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
+ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
+ 
++// Increments whenever a backing buffer is reallocated. Cached graphs that
++// share a gallocr can use this to invalidate tensor pointers captured before
++// the most recent growth.
++GGML_API size_t ggml_gallocr_get_buffer_generation(ggml_gallocr_t galloc);
++
+ GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
+ 
+ // Utils
+diff --git a/include/ggml-cuda.h b/include/ggml-cuda.h
+index 22ad2c00..a1acce65 100644
+--- a/include/ggml-cuda.h
++++ b/include/ggml-cuda.h
+@@ -37,6 +37,10 @@ GGML_BACKEND_API int  ggml_backend_cuda_get_device_count(void);
+ GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
+ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
+ 
++// Drops one captured CUDA graph owned by a backend context. The caller must
++// ensure work using graph_key has completed before calling this function.
++GGML_BACKEND_API bool ggml_backend_cuda_graph_reset(ggml_backend_t backend, const void * graph_key);
++
+ GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
+ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
+ 
+diff --git a/include/ggml.h b/include/ggml.h
+index 1988d16d..594fb086 100644
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -545,6 +545,9 @@ extern "C" {
+         GGML_OP_FILL,
+ 
+         GGML_OP_FLASH_ATTN_EXT,
++        GGML_OP_PAGED_ATTN_EXT,
++        GGML_OP_PAGED_KV_WRITE_EXT,
++        GGML_OP_FSMN_EXT,
+         GGML_OP_FLASH_ATTN_BACK,
+         GGML_OP_SSM_CONV,
+         GGML_OP_SSM_SCAN,
+@@ -2332,6 +2335,73 @@ extern "C" {
+             float                 max_bias,
+             float                 logit_softcap);
+ 
++    // Decode-only paged KV attention.
++    // q:           [n_embd_head, 1, n_head, 1]
++    // k_cache:     [n_embd_head * n_head_kv, physical_rows]
++    // v_cache:     [n_embd_head * n_head_kv, physical_rows]
++    // block_table: [n_blocks], physical block ids
++    // res:         [n_embd_head, n_head, 1, 1]
++    GGML_API struct ggml_tensor * ggml_paged_attn_ext(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * k_cache,
++            struct ggml_tensor  * v_cache,
++            struct ggml_tensor  * block_table,
++            float                 scale,
++            int                   block_size,
++            int                   n_kv,
++            int                   n_head_kv);
++
++    GGML_API struct ggml_tensor * ggml_paged_attn_ext_v(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * k_cache,
++            struct ggml_tensor  * v_cache,
++            struct ggml_tensor  * block_table,
++            struct ggml_tensor  * kv_lens,
++            float                 scale,
++            int                   block_size,
++            int                   max_n_kv,
++            int                   n_head_kv);
++
++    GGML_API struct ggml_tensor * ggml_paged_attn_ext_v_dep(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * k_cache,
++            struct ggml_tensor  * v_cache,
++            struct ggml_tensor  * block_table,
++            struct ggml_tensor  * kv_lens,
++            struct ggml_tensor  * kv_write_dependency,
++            float                 scale,
++            int                   block_size,
++            int                   max_n_kv,
++            int                   n_head_kv);
++
++    // Decode-only paged KV write.
++    // k_cur/v_cur:   [kv_dim, batch], F32
++    // k_cache/v_cache: [kv_dim, physical_rows], F16, layer-local views
++    // block_table:   [max_blocks, batch], I32
++    // positions:     [batch], I32 absolute token positions before write
++    GGML_API struct ggml_tensor * ggml_paged_kv_write_ext(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * k_cur,
++            struct ggml_tensor  * v_cur,
++            struct ggml_tensor  * k_cache,
++            struct ggml_tensor  * v_cache,
++            struct ggml_tensor  * block_table,
++            struct ggml_tensor  * positions,
++            int                   block_size);
++
++    // FunASR SANM/FSMN memory fused op.
++    // v:      [dim, T, batch] F32
++    // weight: [kernel_size, 1, dim]
++    // res:    [dim, T, batch] F32, includes the residual + v
++    GGML_API struct ggml_tensor * ggml_fsmn_ext(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * v,
++            struct ggml_tensor  * weight,
++            int                   pad);
++
+     GGML_API void ggml_flash_attn_ext_set_prec(
+             struct ggml_tensor * a,
+             enum ggml_prec       prec);
+diff --git a/src/ggml-alloc.c b/src/ggml-alloc.c
+index 41419b61..f4c79c5b 100644
+--- a/src/ggml-alloc.c
++++ b/src/ggml-alloc.c
+@@ -496,6 +496,7 @@ struct ggml_gallocr {
+ 
+     struct leaf_alloc * leaf_allocs; // [n_leafs]
+     int n_leafs;
++    size_t buffer_generation;
+ };
+ 
+ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
+@@ -936,6 +937,7 @@ static bool ggml_gallocr_reserve_n_impl(
+             }
+ #endif
+             ggml_vbuffer_free(galloc->buffers[i]);
++            galloc->buffer_generation++;
+             if (no_alloc) {
+                 galloc->buffers[i] = NULL;
+             } else {
+@@ -1100,6 +1102,10 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
+     return true;
+ }
+ 
++size_t ggml_gallocr_get_buffer_generation(ggml_gallocr_t galloc) {
++    return galloc ? galloc->buffer_generation : 0;
++}
++
+ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
+     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+ 
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index b1de2ae8..bf8a5cf3 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1964,6 +1964,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_flash_attn_ext(params, tensor);
+             } break;
++        case GGML_OP_PAGED_ATTN_EXT:
++            {
++                GGML_ABORT("GGML_OP_PAGED_ATTN_EXT is CUDA-only");
++            } break;
++        case GGML_OP_PAGED_KV_WRITE_EXT:
++            {
++                GGML_ABORT("GGML_OP_PAGED_KV_WRITE_EXT is CUDA-only");
++            } break;
++        case GGML_OP_FSMN_EXT:
++            {
++                GGML_ABORT("GGML_OP_FSMN_EXT is CUDA-only");
++            } break;
+         case GGML_OP_FLASH_ATTN_BACK:
+             {
+                 int32_t t = ggml_get_op_params_i32(tensor, 0);
+@@ -2334,6 +2346,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_ARGSORT:
+         case GGML_OP_TOP_K:
+         case GGML_OP_FLASH_ATTN_EXT:
++        case GGML_OP_PAGED_ATTN_EXT:
++        case GGML_OP_PAGED_KV_WRITE_EXT:
+         case GGML_OP_FLASH_ATTN_BACK:
+         case GGML_OP_SSM_CONV:
+         case GGML_OP_SSM_SCAN:
+@@ -2874,6 +2888,10 @@ struct ggml_cplan ggml_graph_plan(
+                         // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + padding
+                         cur = sizeof(float)*(GGML_FA_TILE_Q*DK + 2*GGML_FA_TILE_Q*GGML_FA_TILE_KV + GGML_FA_TILE_Q*DV + GGML_FA_TILE_KV*DV)*n_tasks;
+                     } break;
++                case GGML_OP_PAGED_ATTN_EXT:
++                case GGML_OP_PAGED_KV_WRITE_EXT:
++                    {
++                    } break;
+                 case GGML_OP_FLASH_ATTN_BACK:
+                     {
+                         const int64_t    D = node->src[0]->ne[0];
+diff --git a/src/ggml-cuda/fsmn.cu b/src/ggml-cuda/fsmn.cu
+new file mode 100644
+index 00000000..ef1f9625
+--- /dev/null
++++ b/src/ggml-cuda/fsmn.cu
+@@ -0,0 +1,90 @@
++#include "fsmn.cuh"
++
++#include <cuda_fp16.h>
++#include <type_traits>
++
++template <typename W>
++static __global__ void fsmn_ext_kernel(
++        const float * __restrict__ v,
++        const W     * __restrict__ w,
++        float       * __restrict__ dst,
++        int dim,
++        int T,
++        int batch,
++        int K,
++        int pad) {
++    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    const int n = dim * T * batch;
++    if (idx >= n) {
++        return;
++    }
++
++    const int d = idx % dim;
++    const int row = idx / dim;
++    const int t = row % T;
++    const int b = row / T;
++    const size_t sequence_offset = (size_t) b * T * dim;
++
++    float acc = v[idx];
++    const W * w_row = w + (size_t) d * K;
++    for (int k = 0; k < K; k++) {
++        const int src_t = t + k - pad;
++        if (src_t < 0 || src_t >= T) {
++            continue;
++        }
++        float wk;
++        if constexpr (std::is_same<W, half>::value) {
++            wk = __half2float(w_row[k]);
++        } else {
++            wk = static_cast<float>(w_row[k]);
++        }
++        acc += v[sequence_offset + (size_t) src_t * dim + d] * wk;
++    }
++    dst[idx] = acc;
++}
++
++void ggml_cuda_fsmn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * v = dst->src[0];
++    const ggml_tensor * w = dst->src[1];
++
++    const int pad = dst->op_params[0];
++    const int dim = (int) v->ne[0];
++    const int T   = (int) v->ne[1];
++    const int batch = (int) v->ne[2];
++    const int K   = (int) w->ne[0];
++    const int n   = dim * T * batch;
++
++    const int threads = 256;
++    const int blocks = (n + threads - 1) / threads;
++    if (w->type == GGML_TYPE_F16) {
++        fsmn_ext_kernel<<<blocks, threads, 0, ctx.stream()>>>(
++            (const float *) v->data,
++            (const half  *) w->data,
++            (float       *) dst->data,
++            dim, T, batch, K, pad);
++    } else {
++        fsmn_ext_kernel<<<blocks, threads, 0, ctx.stream()>>>(
++            (const float *) v->data,
++            (const float *) w->data,
++            (float       *) dst->data,
++            dim, T, batch, K, pad);
++    }
++}
++
++bool ggml_cuda_fsmn_ext_supported(const ggml_tensor * dst) {
++    const ggml_tensor * v = dst->src[0];
++    const ggml_tensor * w = dst->src[1];
++    if (!v || !w) {
++        return false;
++    }
++    if (v->type != GGML_TYPE_F32 ||
++        (w->type != GGML_TYPE_F16 && w->type != GGML_TYPE_F32) ||
++        dst->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (v->ne[2] <= 0 || v->ne[3] != 1 ||
++        w->ne[1] != 1 || w->ne[2] != v->ne[0]) {
++        return false;
++    }
++    return ggml_is_contiguous(v) && ggml_is_contiguous(w);
++}
+diff --git a/src/ggml-cuda/fsmn.cuh b/src/ggml-cuda/fsmn.cuh
+new file mode 100644
+index 00000000..b01f09ad
+--- /dev/null
++++ b/src/ggml-cuda/fsmn.cuh
+@@ -0,0 +1,7 @@
++#pragma once
++
++#include "common.cuh"
++
++void ggml_cuda_fsmn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++bool ggml_cuda_fsmn_ext_supported(const ggml_tensor * dst);
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 08383edb..fab3cb36 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -23,6 +23,9 @@
+ #include "ggml-cuda/diagmask.cuh"
+ #include "ggml-cuda/diag.cuh"
+ #include "ggml-cuda/fattn.cuh"
++#include "ggml-cuda/paged-attn.cuh"
++#include "ggml-cuda/paged-kv-write.cuh"
++#include "ggml-cuda/fsmn.cuh"
+ #include "ggml-cuda/getrows.cuh"
+ #include "ggml-cuda/im2col.cuh"
+ #include "ggml-cuda/mmf.cuh"
+@@ -2712,6 +2715,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_FLASH_ATTN_EXT:
+             ggml_cuda_flash_attn_ext(ctx, dst);
+             break;
++        case GGML_OP_PAGED_ATTN_EXT:
++            ggml_cuda_paged_attn_ext(ctx, dst);
++            break;
++        case GGML_OP_PAGED_KV_WRITE_EXT:
++            ggml_cuda_paged_kv_write_ext(ctx, dst);
++            break;
++        case GGML_OP_FSMN_EXT:
++            ggml_cuda_fsmn_ext(ctx, dst);
++            break;
+         case GGML_OP_CROSS_ENTROPY_LOSS:
+             ggml_cuda_cross_entropy_loss(ctx, dst);
+             break;
+@@ -4842,6 +4854,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+             return true;
+         case GGML_OP_FLASH_ATTN_EXT:
+             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
++        case GGML_OP_PAGED_ATTN_EXT:
++            return ggml_cuda_paged_attn_ext_supported(op);
++        case GGML_OP_PAGED_KV_WRITE_EXT:
++            return ggml_cuda_paged_kv_write_ext_supported(op);
++        case GGML_OP_FSMN_EXT:
++            return ggml_cuda_fsmn_ext_supported(op);
+         case GGML_OP_CROSS_ENTROPY_LOSS:
+         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+         case GGML_OP_OPT_STEP_ADAMW:
+@@ -5119,4 +5137,19 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+     return cuda_backend;
+ }
+ 
++bool ggml_backend_cuda_graph_reset(ggml_backend_t backend, const void * graph_key) {
++    if (!backend || !graph_key || !ggml_backend_is_cuda(backend)) {
++        return false;
++    }
++#ifdef USE_CUDA_GRAPH
++    ggml_backend_cuda_context * ctx =
++        (ggml_backend_cuda_context *) backend->context;
++    ctx->cuda_graphs.erase(graph_key);
++#else
++    GGML_UNUSED(backend);
++    GGML_UNUSED(graph_key);
++#endif
++    return true;
++}
++
+ GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)
+diff --git a/src/ggml-cuda/mmq.cu b/src/ggml-cuda/mmq.cu
+index 9a69f41d..a35f46ab 100644
+--- a/src/ggml-cuda/mmq.cu
++++ b/src/ggml-cuda/mmq.cu
+@@ -3,6 +3,39 @@
+ #include "quantize.cuh"
+ #include "mmid.cuh"
+ 
++#include <cstdlib>
++
++static bool ggml_cuda_disable_mmq_stream_k() {
++    static const bool value = []() {
++        const char * env = std::getenv("FUNASR_DISABLE_MMQ_STREAM_K");
++        return env != nullptr && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
++    }();
++    return value;
++}
++
++static int64_t ggml_cuda_mmq_stream_k_min_ncols() {
++    static const int64_t value = []() {
++        const char * env = std::getenv("FUNASR_MMQ_STREAM_K_MIN_NCOLS");
++        if (env == nullptr || env[0] == '\0') {
++            return int64_t(0);
++        }
++
++        char * end = nullptr;
++        const long parsed = std::strtol(env, &end, 10);
++        if (end == env || parsed <= 0) {
++            return int64_t(0);
++        }
++
++        return int64_t(parsed);
++    }();
++    return value;
++}
++
++static bool ggml_cuda_should_disable_mmq_stream_k(int64_t ncols) {
++    const int64_t min_ncols = ggml_cuda_mmq_stream_k_min_ncols();
++    return ggml_cuda_disable_mmq_stream_k() || (min_ncols > 0 && ncols < min_ncols);
++}
++
+ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+     switch (args.type_x) {
+         case GGML_TYPE_Q4_0:
+@@ -112,8 +145,9 @@ void ggml_cuda_mul_mat_q(
+     const int64_t s03 = src0->nb[3] / ts_src0;
+     const int64_t s3  =  dst->nb[3] / ts_dst;
+ 
+-    const bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
+-                            || GGML_CUDA_CC_IS_CDNA(cc);
++    const bool use_stream_k = !ggml_cuda_disable_mmq_stream_k() &&
++                            ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
++                            || GGML_CUDA_CC_IS_CDNA(cc));
+ 
+     // TODO: tighter pool buffer size vs q8 path
+     const bool use_native_mxfp4 = blackwell_mma_available(cc) && src0->type == GGML_TYPE_MXFP4;
+@@ -244,9 +278,10 @@ void ggml_cuda_op_mul_mat_q(
+     // The stream-k decomposition is only faster for recent NVIDIA GPUs.
+     // Also its fixup needs to allocate a temporary buffer in the memory pool.
+     // There are multiple parallel CUDA streams for src1_ncols != ne11 which would introduce a race condition for this buffer.
+-    const bool use_stream_k = ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
++    const bool use_stream_k = !ggml_cuda_should_disable_mmq_stream_k(src1_ncols) &&
++                            (((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
+                             || GGML_CUDA_CC_IS_CDNA(cc))
+-                            && src1_ncols == ne11;
++                            && src1_ncols == ne11);
+     const mmq_args args = {
+         src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr, dst_dd_i,
+         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
+diff --git a/src/ggml-cuda/paged-attn.cu b/src/ggml-cuda/paged-attn.cu
+new file mode 100644
+index 00000000..3d7e1c22
+--- /dev/null
++++ b/src/ggml-cuda/paged-attn.cu
+@@ -0,0 +1,624 @@
++#include "paged-attn.cuh"
++#include "paged-kv-write.cuh"
++
++#include <cuda_fp16.h>
++#include <cfloat>
++#include <cstdlib>
++#include <cstring>
++
++namespace {
++
++struct paged_attn_profile_state {
++    long calls = 0;
++    double ms = 0.0;
++};
++
++paged_attn_profile_state g_paged_attn_profile;
++
++static bool paged_attn_profile_enabled() {
++    const char * value = std::getenv("FUNASR_PROFILE_PAGED_ATTN");
++    return value && std::strcmp(value, "0") != 0;
++}
++
++static bool paged_attn_v2_enabled() {
++    const char * value = std::getenv("FUNASR_PAGED_ATTN_V2");
++    return value && std::strcmp(value, "0") != 0;
++}
++
++static bool paged_attn_v1_enabled() {
++    const char * value = std::getenv("FUNASR_PAGED_ATTN_V1");
++    return value && std::strcmp(value, "0") != 0;
++}
++
++} // namespace
++
++GGML_CUDA_PAGED_ATTN_PROFILE_API void ggml_cuda_paged_attn_profile_reset() {
++    g_paged_attn_profile = paged_attn_profile_state{};
++}
++
++GGML_CUDA_PAGED_ATTN_PROFILE_API void ggml_cuda_paged_attn_profile_get(long * calls, double * ms) {
++    if (calls) {
++        *calls = g_paged_attn_profile.calls;
++    }
++    if (ms) {
++        *ms = g_paged_attn_profile.ms;
++    }
++}
++
++static __global__ void paged_kv_write_f32_to_f16_kernel(
++        const float * __restrict__ k_cur,
++        const float * __restrict__ v_cur,
++        half        * __restrict__ k_cache,
++        half        * __restrict__ v_cache,
++        const int   * __restrict__ block_table,
++        const int   * __restrict__ positions,
++        int kv_dim,
++        int batch,
++        int physical_rows,
++        int table_stride,
++        int block_size) {
++    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    const int n = kv_dim * batch;
++    if (idx >= n) {
++        return;
++    }
++
++    const int d = idx % kv_dim;
++    const int b = idx / kv_dim;
++    const int pos = positions[b];
++    const int block_idx = pos / block_size;
++    const int block_off = pos % block_size;
++    const int block_id = block_table[(size_t) b * table_stride + block_idx];
++    const int physical_row = block_id * block_size + block_off;
++    if (physical_row < 0 || physical_row >= physical_rows) {
++        return;
++    }
++
++    const size_t src = (size_t) b * kv_dim + d;
++    const size_t out = (size_t) physical_row * kv_dim + d;
++    k_cache[out] = __float2half(k_cur[src]);
++    v_cache[out] = __float2half(v_cur[src]);
++}
++
++void ggml_cuda_paged_kv_write_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * k_cur       = dst->src[0];
++    const ggml_tensor * v_cur       = dst->src[1];
++    const ggml_tensor * k_cache     = dst->src[2];
++    const ggml_tensor * v_cache     = dst->src[3];
++    const ggml_tensor * block_table = dst->src[4];
++    const ggml_tensor * positions   = dst->src[5];
++
++    const int block_size = dst->op_params[0];
++    const int kv_dim = (int) k_cur->ne[0];
++    const int batch = (int) k_cur->ne[1];
++    const int physical_rows = (int) k_cache->ne[1];
++    const int table_stride = (int) block_table->ne[0];
++    const int n = kv_dim * batch;
++
++    const int threads = 256;
++    const int blocks = (n + threads - 1) / threads;
++    paged_kv_write_f32_to_f16_kernel<<<blocks, threads, 0, ctx.stream()>>>(
++        (const float *) k_cur->data,
++        (const float *) v_cur->data,
++        (half        *) k_cache->data,
++        (half        *) v_cache->data,
++        (const int   *) block_table->data,
++        (const int   *) positions->data,
++        kv_dim,
++        batch,
++        physical_rows,
++        table_stride,
++        block_size);
++}
++
++bool ggml_cuda_paged_kv_write_ext_supported(const ggml_tensor * dst) {
++    const ggml_tensor * k_cur       = dst->src[0];
++    const ggml_tensor * v_cur       = dst->src[1];
++    const ggml_tensor * k_cache     = dst->src[2];
++    const ggml_tensor * v_cache     = dst->src[3];
++    const ggml_tensor * block_table = dst->src[4];
++    const ggml_tensor * positions   = dst->src[5];
++
++    if (!k_cur || !v_cur || !k_cache || !v_cache || !block_table || !positions) {
++        return false;
++    }
++    if (k_cur->type != GGML_TYPE_F32 || v_cur->type != GGML_TYPE_F32 ||
++        k_cache->type != GGML_TYPE_F16 || v_cache->type != GGML_TYPE_F16 ||
++        block_table->type != GGML_TYPE_I32 || positions->type != GGML_TYPE_I32 ||
++        dst->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (k_cur->ne[0] != v_cur->ne[0] || k_cur->ne[1] != v_cur->ne[1] ||
++        k_cache->ne[0] != v_cache->ne[0] || k_cache->ne[1] != v_cache->ne[1] ||
++        k_cur->ne[0] != k_cache->ne[0] || block_table->ne[1] != k_cur->ne[1] ||
++        positions->ne[0] != k_cur->ne[1]) {
++        return false;
++    }
++    return ggml_is_contiguous(k_cur) && ggml_is_contiguous(v_cur) &&
++           ggml_is_contiguous(k_cache) && ggml_is_contiguous(v_cache) &&
++           ggml_is_contiguous(block_table) && ggml_is_contiguous(positions);
++}
++
++static __device__ __forceinline__ float warp_reduce_sum(float v) {
++#pragma unroll
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        v += __shfl_down_sync(0xffffffff, v, offset);
++    }
++    return v;
++}
++
++static __device__ __forceinline__ float block_reduce_sum(float v) {
++    __shared__ float shared[32];
++    const int lane = threadIdx.x & 31;
++    const int wid  = threadIdx.x >> 5;
++
++    v = warp_reduce_sum(v);
++    if (lane == 0) {
++        shared[wid] = v;
++    }
++    __syncthreads();
++
++    v = threadIdx.x < (blockDim.x >> 5) ? shared[lane] : 0.0f;
++    if (wid == 0) {
++        v = warp_reduce_sum(v);
++    }
++    return v;
++}
++
++static __device__ __forceinline__ float warp_reduce_max(float v) {
++#pragma unroll
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        v = fmaxf(v, __shfl_down_sync(0xffffffff, v, offset));
++    }
++    return v;
++}
++
++static __device__ __forceinline__ float block_reduce_max(float v) {
++    __shared__ float shared[32];
++    const int lane = threadIdx.x & 31;
++    const int wid  = threadIdx.x >> 5;
++
++    v = warp_reduce_max(v);
++    if (lane == 0) {
++        shared[wid] = v;
++    }
++    __syncthreads();
++
++    v = threadIdx.x < (blockDim.x >> 5) ? shared[lane] : -FLT_MAX;
++    if (wid == 0) {
++        v = warp_reduce_max(v);
++    }
++    return v;
++}
++
++__global__ void paged_attn_decode_f32_f16(
++        const float * __restrict__ q,
++        const half  * __restrict__ k_cache,
++        const half  * __restrict__ v_cache,
++        const int   * __restrict__ block_table,
++        const int   * __restrict__ kv_lens,
++        float       * __restrict__ dst,
++        int head_dim,
++        int n_heads,
++        int n_kv_heads,
++        int max_n_kv,
++        int block_size,
++        int kv_dim,
++        int table_stride,
++        float scale) {
++    extern __shared__ float scores[];
++    const int head = blockIdx.x;
++    const int batch = blockIdx.y;
++    if (head >= n_heads) {
++        return;
++    }
++
++    const int gqa_ratio = n_heads / n_kv_heads;
++    const int kv_head = head / gqa_ratio;
++    const int * block_table_b = block_table + (size_t) batch * table_stride;
++    const float * q_head = q + ((size_t) batch * n_heads + head) * head_dim;
++    const int n_kv = kv_lens ? kv_lens[batch] : max_n_kv;
++
++    float local_max = -FLT_MAX;
++    for (int pos = threadIdx.x; pos < n_kv; pos += blockDim.x) {
++        const int block_id = block_table_b[pos / block_size];
++        const int physical_row = block_id * block_size + (pos % block_size);
++        const half * k_row = k_cache + (size_t) physical_row * kv_dim + (size_t) kv_head * head_dim;
++
++        float dot = 0.0f;
++        for (int d = 0; d < head_dim; ++d) {
++            dot += q_head[d] * __half2float(k_row[d]);
++        }
++        const float score = dot * scale;
++        scores[pos] = score;
++        local_max = fmaxf(local_max, score);
++    }
++
++    __shared__ float s_max;
++    local_max = block_reduce_max(local_max);
++    if (threadIdx.x == 0) {
++        s_max = local_max;
++    }
++    __syncthreads();
++
++    float local_sum = 0.0f;
++    for (int pos = threadIdx.x; pos < n_kv; pos += blockDim.x) {
++        local_sum += expf(scores[pos] - s_max);
++    }
++    local_sum = block_reduce_sum(local_sum);
++
++    __shared__ float s_sum;
++    if (threadIdx.x == 0) {
++        s_sum = local_sum;
++    }
++    __syncthreads();
++
++    for (int pos = threadIdx.x; pos < n_kv; pos += blockDim.x) {
++        scores[pos] = expf(scores[pos] - s_max) / s_sum;
++    }
++    __syncthreads();
++
++    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
++        float acc = 0.0f;
++        for (int pos = 0; pos < n_kv; ++pos) {
++            const int block_id = block_table_b[pos / block_size];
++            const int physical_row = block_id * block_size + (pos % block_size);
++            const half * v_row = v_cache + (size_t) physical_row * kv_dim + (size_t) kv_head * head_dim;
++            acc += scores[pos] * __half2float(v_row[d]);
++        }
++        dst[((size_t) batch * n_heads + head) * head_dim + d] = acc;
++    }
++}
++
++__global__ void paged_attn_decode_f32_f16_warp_qk(
++        const float * __restrict__ q,
++        const half  * __restrict__ k_cache,
++        const half  * __restrict__ v_cache,
++        const int   * __restrict__ block_table,
++        const int   * __restrict__ kv_lens,
++        float       * __restrict__ dst,
++        int head_dim,
++        int n_heads,
++        int n_kv_heads,
++        int max_n_kv,
++        int block_size,
++        int kv_dim,
++        int table_stride,
++        float scale) {
++    extern __shared__ float scores[];
++    const int head = blockIdx.x;
++    const int batch = blockIdx.y;
++    if (head >= n_heads) {
++        return;
++    }
++
++    const int lane = threadIdx.x & 31;
++    const int warp = threadIdx.x >> 5;
++    const int n_warps = blockDim.x >> 5;
++
++    const int gqa_ratio = n_heads / n_kv_heads;
++    const int kv_head = head / gqa_ratio;
++    const int * block_table_b = block_table + (size_t) batch * table_stride;
++    const float * q_head = q + ((size_t) batch * n_heads + head) * head_dim;
++    const int n_kv = kv_lens ? kv_lens[batch] : max_n_kv;
++
++    float local_max = -FLT_MAX;
++    for (int pos = warp; pos < n_kv; pos += n_warps) {
++        const int block_id = block_table_b[pos / block_size];
++        const int physical_row = block_id * block_size + (pos % block_size);
++        const half * k_row = k_cache + (size_t) physical_row * kv_dim + (size_t) kv_head * head_dim;
++
++        float dot = 0.0f;
++        for (int d = lane; d < head_dim; d += 32) {
++            dot += q_head[d] * __half2float(k_row[d]);
++        }
++        dot = warp_reduce_sum(dot);
++        if (lane == 0) {
++            const float score = dot * scale;
++            scores[pos] = score;
++            local_max = fmaxf(local_max, score);
++        }
++    }
++
++    __shared__ float s_max;
++    local_max = block_reduce_max(local_max);
++    if (threadIdx.x == 0) {
++        s_max = local_max;
++    }
++    __syncthreads();
++
++    float local_sum = 0.0f;
++    for (int pos = threadIdx.x; pos < n_kv; pos += blockDim.x) {
++        local_sum += expf(scores[pos] - s_max);
++    }
++    local_sum = block_reduce_sum(local_sum);
++
++    __shared__ float s_sum;
++    if (threadIdx.x == 0) {
++        s_sum = local_sum;
++    }
++    __syncthreads();
++
++    for (int pos = threadIdx.x; pos < n_kv; pos += blockDim.x) {
++        scores[pos] = expf(scores[pos] - s_max) / s_sum;
++    }
++    __syncthreads();
++
++    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
++        float acc = 0.0f;
++        for (int pos = 0; pos < n_kv; ++pos) {
++            const int block_id = block_table_b[pos / block_size];
++            const int physical_row = block_id * block_size + (pos % block_size);
++            const half * v_row = v_cache + (size_t) physical_row * kv_dim + (size_t) kv_head * head_dim;
++            acc += scores[pos] * __half2float(v_row[d]);
++        }
++        dst[((size_t) batch * n_heads + head) * head_dim + d] = acc;
++    }
++}
++
++__global__ void paged_attn_decode_f32_f16_warp_qk_cached_rows(
++        const float * __restrict__ q,
++        const half  * __restrict__ k_cache,
++        const half  * __restrict__ v_cache,
++        const int   * __restrict__ block_table,
++        const int   * __restrict__ kv_lens,
++        float       * __restrict__ dst,
++        int head_dim,
++        int n_heads,
++        int n_kv_heads,
++        int max_n_kv,
++        int block_size,
++        int kv_dim,
++        int table_stride,
++        float scale) {
++    extern __shared__ char shared_raw[];
++    float * scores = reinterpret_cast<float *>(shared_raw);
++    int * physical_rows = reinterpret_cast<int *>(scores + max_n_kv);
++
++    const int head = blockIdx.x;
++    const int batch = blockIdx.y;
++    if (head >= n_heads) {
++        return;
++    }
++
++    const int lane = threadIdx.x & 31;
++    const int warp = threadIdx.x >> 5;
++    const int n_warps = blockDim.x >> 5;
++
++    const int gqa_ratio = n_heads / n_kv_heads;
++    const int kv_head = head / gqa_ratio;
++    const int * block_table_b = block_table + (size_t) batch * table_stride;
++    const float * q_head = q + ((size_t) batch * n_heads + head) * head_dim;
++    const int n_kv = kv_lens ? kv_lens[batch] : max_n_kv;
++
++    float local_max = -FLT_MAX;
++    for (int pos = warp; pos < n_kv; pos += n_warps) {
++        const int block_id = block_table_b[pos / block_size];
++        const int physical_row = block_id * block_size + (pos % block_size);
++        const half * k_row = k_cache + (size_t) physical_row * kv_dim + (size_t) kv_head * head_dim;
++
++        float dot = 0.0f;
++        for (int d = lane; d < head_dim; d += 32) {
++            dot += q_head[d] * __half2float(k_row[d]);
++        }
++        dot = warp_reduce_sum(dot);
++        if (lane == 0) {
++            const float score = dot * scale;
++            scores[pos] = score;
++            physical_rows[pos] = physical_row;
++            local_max = fmaxf(local_max, score);
++        }
++    }
++
++    __shared__ float s_max;
++    local_max = block_reduce_max(local_max);
++    if (threadIdx.x == 0) {
++        s_max = local_max;
++    }
++    __syncthreads();
++
++    float local_sum = 0.0f;
++    for (int pos = threadIdx.x; pos < n_kv; pos += blockDim.x) {
++        local_sum += expf(scores[pos] - s_max);
++    }
++    local_sum = block_reduce_sum(local_sum);
++
++    __shared__ float s_sum;
++    if (threadIdx.x == 0) {
++        s_sum = local_sum;
++    }
++    __syncthreads();
++
++    for (int pos = threadIdx.x; pos < n_kv; pos += blockDim.x) {
++        scores[pos] = expf(scores[pos] - s_max) / s_sum;
++    }
++    __syncthreads();
++
++    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
++        float acc = 0.0f;
++        for (int pos = 0; pos < n_kv; ++pos) {
++            const half * v_row = v_cache + (size_t) physical_rows[pos] * kv_dim + (size_t) kv_head * head_dim;
++            acc += scores[pos] * __half2float(v_row[d]);
++        }
++        dst[((size_t) batch * n_heads + head) * head_dim + d] = acc;
++    }
++}
++
++void ggml_cuda_paged_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * q           = dst->src[0];
++    const ggml_tensor * k_cache     = dst->src[1];
++    const ggml_tensor * v_cache     = dst->src[2];
++    const ggml_tensor * block_table = dst->src[3];
++    const ggml_tensor * kv_lens     = dst->src[4];
++
++    float scale;
++    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
++    const int block_size = dst->op_params[1];
++    const int max_n_kv   = dst->op_params[2];
++    const int n_kv_heads = dst->op_params[3];
++
++    const int head_dim = q->ne[0];
++    const int n_heads  = q->ne[2];
++    const int n_batch  = q->ne[3];
++    const int kv_dim   = k_cache->ne[0];
++    const int table_stride = block_table->ne[0];
++
++    const dim3 grid(n_heads, n_batch, 1);
++    const dim3 block(256, 1, 1);
++
++    const bool use_v1 = paged_attn_v1_enabled();
++    const bool use_v2 = !use_v1 && paged_attn_v2_enabled();
++    const bool use_v3 = !use_v1 && !use_v2;
++    const size_t shared = (size_t) max_n_kv * sizeof(float) +
++                          (use_v3 ? (size_t) max_n_kv * sizeof(int) : 0);
++    if (paged_attn_profile_enabled()) {
++        cudaEvent_t start;
++        cudaEvent_t stop;
++        CUDA_CHECK(cudaEventCreate(&start));
++        CUDA_CHECK(cudaEventCreate(&stop));
++        CUDA_CHECK(cudaEventRecord(start, ctx.stream()));
++        if (use_v3) {
++            paged_attn_decode_f32_f16_warp_qk_cached_rows<<<grid, block, shared, ctx.stream()>>>(
++                (const float *) q->data,
++                (const half  *) k_cache->data,
++                (const half  *) v_cache->data,
++                (const int   *) block_table->data,
++                kv_lens ? (const int *) kv_lens->data : nullptr,
++                (float       *) dst->data,
++                head_dim,
++                n_heads,
++                n_kv_heads,
++                max_n_kv,
++                block_size,
++                kv_dim,
++                table_stride,
++                scale);
++        } else if (use_v2) {
++            paged_attn_decode_f32_f16_warp_qk<<<grid, block, shared, ctx.stream()>>>(
++                (const float *) q->data,
++                (const half  *) k_cache->data,
++                (const half  *) v_cache->data,
++                (const int   *) block_table->data,
++                kv_lens ? (const int *) kv_lens->data : nullptr,
++                (float       *) dst->data,
++                head_dim,
++                n_heads,
++                n_kv_heads,
++                max_n_kv,
++                block_size,
++                kv_dim,
++                table_stride,
++                scale);
++        } else {
++            paged_attn_decode_f32_f16<<<grid, block, shared, ctx.stream()>>>(
++                (const float *) q->data,
++                (const half  *) k_cache->data,
++                (const half  *) v_cache->data,
++                (const int   *) block_table->data,
++                kv_lens ? (const int *) kv_lens->data : nullptr,
++                (float       *) dst->data,
++                head_dim,
++                n_heads,
++                n_kv_heads,
++                max_n_kv,
++                block_size,
++                kv_dim,
++                table_stride,
++                scale);
++        }
++        CUDA_CHECK(cudaEventRecord(stop, ctx.stream()));
++        CUDA_CHECK(cudaEventSynchronize(stop));
++        float elapsed = 0.0f;
++        CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, stop));
++        CUDA_CHECK(cudaEventDestroy(start));
++        CUDA_CHECK(cudaEventDestroy(stop));
++        g_paged_attn_profile.calls++;
++        g_paged_attn_profile.ms += static_cast<double>(elapsed);
++    } else {
++        if (use_v3) {
++            paged_attn_decode_f32_f16_warp_qk_cached_rows<<<grid, block, shared, ctx.stream()>>>(
++                (const float *) q->data,
++                (const half  *) k_cache->data,
++                (const half  *) v_cache->data,
++                (const int   *) block_table->data,
++                kv_lens ? (const int *) kv_lens->data : nullptr,
++                (float       *) dst->data,
++                head_dim,
++                n_heads,
++                n_kv_heads,
++                max_n_kv,
++                block_size,
++                kv_dim,
++                table_stride,
++                scale);
++        } else if (use_v2) {
++            paged_attn_decode_f32_f16_warp_qk<<<grid, block, shared, ctx.stream()>>>(
++                (const float *) q->data,
++                (const half  *) k_cache->data,
++                (const half  *) v_cache->data,
++                (const int   *) block_table->data,
++                kv_lens ? (const int *) kv_lens->data : nullptr,
++                (float       *) dst->data,
++                head_dim,
++                n_heads,
++                n_kv_heads,
++                max_n_kv,
++                block_size,
++                kv_dim,
++                table_stride,
++                scale);
++        } else {
++            paged_attn_decode_f32_f16<<<grid, block, shared, ctx.stream()>>>(
++                (const float *) q->data,
++                (const half  *) k_cache->data,
++                (const half  *) v_cache->data,
++                (const int   *) block_table->data,
++                kv_lens ? (const int *) kv_lens->data : nullptr,
++                (float       *) dst->data,
++                head_dim,
++                n_heads,
++                n_kv_heads,
++                max_n_kv,
++                block_size,
++                kv_dim,
++                table_stride,
++                scale);
++        }
++    }
++}
++
++bool ggml_cuda_paged_attn_ext_supported(const ggml_tensor * dst) {
++    const ggml_tensor * q           = dst->src[0];
++    const ggml_tensor * k_cache     = dst->src[1];
++    const ggml_tensor * v_cache     = dst->src[2];
++    const ggml_tensor * block_table = dst->src[3];
++    const ggml_tensor * kv_lens     = dst->src[4];
++    const ggml_tensor * kv_write_dependency = dst->src[5];
++
++    if (!q || !k_cache || !v_cache || !block_table) {
++        return false;
++    }
++    if (q->type != GGML_TYPE_F32 || k_cache->type != GGML_TYPE_F16 ||
++        v_cache->type != GGML_TYPE_F16 || block_table->type != GGML_TYPE_I32) {
++        return false;
++    }
++    if (kv_lens && (kv_lens->type != GGML_TYPE_I32 || kv_lens->ne[0] != q->ne[3])) {
++        return false;
++    }
++    if (kv_write_dependency && kv_write_dependency->op != GGML_OP_PAGED_KV_WRITE_EXT) {
++        return false;
++    }
++    if (q->ne[1] != 1) {
++        return false;
++    }
++    if (!((q->ne[3] == 1 && block_table->ne[1] == 1) ||
++          block_table->ne[1] == q->ne[3])) {
++        return false;
++    }
++    if (!ggml_is_contiguous(q) || !ggml_is_contiguous(k_cache) ||
++        !ggml_is_contiguous(v_cache) || !ggml_is_contiguous(block_table) ||
++        (kv_lens && !ggml_is_contiguous(kv_lens))) {
++        return false;
++    }
++    return k_cache->ne[0] == v_cache->ne[0] && k_cache->ne[1] == v_cache->ne[1];
++}
+diff --git a/src/ggml-cuda/paged-attn.cuh b/src/ggml-cuda/paged-attn.cuh
+new file mode 100644
+index 00000000..b3b7ae0f
+--- /dev/null
++++ b/src/ggml-cuda/paged-attn.cuh
+@@ -0,0 +1,16 @@
++#pragma once
++
++#include "common.cuh"
++
++void ggml_cuda_paged_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++bool ggml_cuda_paged_attn_ext_supported(const ggml_tensor * dst);
++
++#if defined(_WIN32)
++#define GGML_CUDA_PAGED_ATTN_PROFILE_API extern "C" __declspec(dllexport)
++#else
++#define GGML_CUDA_PAGED_ATTN_PROFILE_API extern "C"
++#endif
++
++GGML_CUDA_PAGED_ATTN_PROFILE_API void ggml_cuda_paged_attn_profile_reset();
++GGML_CUDA_PAGED_ATTN_PROFILE_API void ggml_cuda_paged_attn_profile_get(long * calls, double * ms);
+diff --git a/src/ggml-cuda/paged-kv-write.cuh b/src/ggml-cuda/paged-kv-write.cuh
+new file mode 100644
+index 00000000..d6257b9e
+--- /dev/null
++++ b/src/ggml-cuda/paged-kv-write.cuh
+@@ -0,0 +1,7 @@
++#pragma once
++
++#include "common.cuh"
++
++void ggml_cuda_paged_kv_write_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++bool ggml_cuda_paged_kv_write_ext_supported(const ggml_tensor * dst);
+diff --git a/src/ggml.c b/src/ggml.c
+index 1725ad16..4103b14f 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -1019,6 +1019,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "FILL",
+ 
+     "FLASH_ATTN_EXT",
++    "PAGED_ATTN_EXT",
++    "PAGED_KV_WRITE_EXT",
++    "FSMN_EXT",
+     "FLASH_ATTN_BACK",
+     "SSM_CONV",
+     "SSM_SCAN",
+@@ -1047,7 +1050,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
++static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1128,6 +1131,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "fill(x, c)",
+ 
+     "flash_attn_ext(x)",
++    "paged_attn_ext(x)",
++    "paged_kv_write_ext(x)",
++    "fsmn_ext(x)",
+     "flash_attn_back(x)",
+     "ssm_conv(x)",
+     "ssm_scan(x)",
+@@ -1156,7 +1162,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
++static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -5294,6 +5300,150 @@ struct ggml_tensor * ggml_flash_attn_ext(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_paged_attn_ext(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k_cache,
++        struct ggml_tensor  * v_cache,
++        struct ggml_tensor  * block_table,
++        float                 scale,
++        int                   block_size,
++        int                   n_kv,
++        int                   n_head_kv) {
++    return ggml_paged_attn_ext_v(
++        ctx, q, k_cache, v_cache, block_table, NULL,
++        scale, block_size, n_kv, n_head_kv);
++}
++
++struct ggml_tensor * ggml_paged_attn_ext_v(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k_cache,
++        struct ggml_tensor  * v_cache,
++        struct ggml_tensor  * block_table,
++        struct ggml_tensor  * kv_lens,
++        float                 scale,
++        int                   block_size,
++        int                   max_n_kv,
++        int                   n_head_kv) {
++    return ggml_paged_attn_ext_v_dep(
++        ctx, q, k_cache, v_cache, block_table, kv_lens, NULL,
++        scale, block_size, max_n_kv, n_head_kv);
++}
++
++struct ggml_tensor * ggml_paged_attn_ext_v_dep(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k_cache,
++        struct ggml_tensor  * v_cache,
++        struct ggml_tensor  * block_table,
++        struct ggml_tensor  * kv_lens,
++        struct ggml_tensor  * kv_write_dependency,
++        float                 scale,
++        int                   block_size,
++        int                   max_n_kv,
++        int                   n_head_kv) {
++    GGML_ASSERT(q->type == GGML_TYPE_F32);
++    GGML_ASSERT(k_cache->type == GGML_TYPE_F16);
++    GGML_ASSERT(v_cache->type == GGML_TYPE_F16);
++    GGML_ASSERT(block_table->type == GGML_TYPE_I32);
++    GGML_ASSERT(kv_lens == NULL || kv_lens->type == GGML_TYPE_I32);
++    GGML_ASSERT(kv_write_dependency == NULL ||
++                kv_write_dependency->op == GGML_OP_PAGED_KV_WRITE_EXT);
++    GGML_ASSERT(q->ne[1] == 1);
++    GGML_ASSERT(k_cache->ne[0] == v_cache->ne[0]);
++    GGML_ASSERT(k_cache->ne[1] == v_cache->ne[1]);
++    GGML_ASSERT(k_cache->ne[0] % n_head_kv == 0);
++    GGML_ASSERT(q->ne[0] == k_cache->ne[0] / n_head_kv);
++    GGML_ASSERT(q->ne[2] % n_head_kv == 0);
++    GGML_ASSERT((q->ne[3] == 1 && block_table->ne[1] == 1) ||
++                block_table->ne[1] == q->ne[3]);
++    GGML_ASSERT(ggml_is_contiguous(q));
++    GGML_ASSERT(ggml_is_contiguous(k_cache));
++    GGML_ASSERT(ggml_is_contiguous(v_cache));
++    GGML_ASSERT(ggml_is_contiguous(block_table));
++    GGML_ASSERT(kv_lens == NULL || ggml_is_contiguous(kv_lens));
++    GGML_ASSERT(kv_lens == NULL || kv_lens->ne[0] == q->ne[3]);
++    GGML_ASSERT(block_size > 0);
++    GGML_ASSERT(max_n_kv > 0);
++
++    int64_t ne[4] = { q->ne[0], q->ne[2], 1, q->ne[3] };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++
++    ggml_set_op_params_f32(result, 0, scale);
++    ggml_set_op_params_i32(result, 1, block_size);
++    ggml_set_op_params_i32(result, 2, max_n_kv);
++    ggml_set_op_params_i32(result, 3, n_head_kv);
++
++    result->op     = GGML_OP_PAGED_ATTN_EXT;
++    result->src[0] = q;
++    result->src[1] = k_cache;
++    result->src[2] = v_cache;
++    result->src[3] = block_table;
++    result->src[4] = kv_lens;
++    result->src[5] = kv_write_dependency;
++
++    return result;
++}
++
++struct ggml_tensor * ggml_paged_kv_write_ext(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * k_cur,
++        struct ggml_tensor  * v_cur,
++        struct ggml_tensor  * k_cache,
++        struct ggml_tensor  * v_cache,
++        struct ggml_tensor  * block_table,
++        struct ggml_tensor  * positions,
++        int                   block_size) {
++    GGML_ASSERT(k_cur->type == GGML_TYPE_F32);
++    GGML_ASSERT(v_cur->type == GGML_TYPE_F32);
++    GGML_ASSERT(k_cache->type == GGML_TYPE_F16);
++    GGML_ASSERT(v_cache->type == GGML_TYPE_F16);
++    GGML_ASSERT(block_table->type == GGML_TYPE_I32);
++    GGML_ASSERT(positions->type == GGML_TYPE_I32);
++    GGML_ASSERT(k_cur->ne[0] == v_cur->ne[0]);
++    GGML_ASSERT(k_cur->ne[1] == v_cur->ne[1]);
++    GGML_ASSERT(k_cache->ne[0] == v_cache->ne[0]);
++    GGML_ASSERT(k_cache->ne[1] == v_cache->ne[1]);
++    GGML_ASSERT(k_cur->ne[0] == k_cache->ne[0]);
++    GGML_ASSERT(block_table->ne[1] == k_cur->ne[1]);
++    GGML_ASSERT(positions->ne[0] == k_cur->ne[1]);
++    GGML_ASSERT(block_size > 0);
++
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
++    ggml_set_op_params_i32(result, 0, block_size);
++
++    result->op     = GGML_OP_PAGED_KV_WRITE_EXT;
++    result->src[0] = k_cur;
++    result->src[1] = v_cur;
++    result->src[2] = k_cache;
++    result->src[3] = v_cache;
++    result->src[4] = block_table;
++    result->src[5] = positions;
++
++    return result;
++}
++
++struct ggml_tensor * ggml_fsmn_ext(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * weight,
++        int                   pad) {
++    GGML_ASSERT(v->type == GGML_TYPE_F32);
++    GGML_ASSERT(weight->type == GGML_TYPE_F16 || weight->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_3d(v));
++    GGML_ASSERT(weight->ne[1] == 1);
++    GGML_ASSERT(weight->ne[2] == v->ne[0]);
++    GGML_ASSERT(pad >= 0 && pad < weight->ne[0]);
++
++    struct ggml_tensor * result = ggml_dup_tensor(ctx, v);
++    ggml_set_op_params_i32(result, 0, pad);
++    result->op     = GGML_OP_FSMN_EXT;
++    result->src[0] = v;
++    result->src[1] = weight;
++    return result;
++}
++
+ void ggml_flash_attn_ext_set_prec(
+         struct ggml_tensor * a,
+         enum ggml_prec       prec) {

@@ -147,4 +147,81 @@ ggml_tensor* adaptor_forward(
     return x;
 }
 
+static ggml_tensor* adaptor_attention_forward_batched(
+    ggml_context* ctx,
+    ggml_tensor* x,
+    ggml_tensor* attention_mask,
+    const AdaptorBlockWeights& block,
+    const AdaptorConfig& cfg
+) {
+    const int T = static_cast<int>(x->ne[1]);
+    const int batch = static_cast<int>(x->ne[2]);
+    const int dim = static_cast<int>(x->ne[0]);
+    const int n_heads = cfg.attention_heads;
+    const int head_dim = dim / n_heads;
+
+    ggml_tensor* q = linear_with_bias(ctx, x, block.attn_q_w, block.attn_q_b);
+    ggml_tensor* k = linear_with_bias(ctx, x, block.attn_k_w, block.attn_k_b);
+    ggml_tensor* v = linear_with_bias(ctx, x, block.attn_v_w, block.attn_v_b);
+    q = ggml_reshape_4d(ctx, q, head_dim, n_heads, T, batch);
+    q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+    k = ggml_reshape_4d(ctx, k, head_dim, n_heads, T, batch);
+    k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+    ggml_tensor* v_4d = ggml_reshape_4d(
+        ctx, v, head_dim, n_heads, T, batch);
+    ggml_tensor* v_perm = ggml_cont(
+        ctx, ggml_permute(ctx, v_4d, 1, 2, 0, 3));
+
+    q = ggml_scale(
+        ctx, q, 1.0f / std::sqrt(static_cast<float>(head_dim)));
+    ggml_tensor* scores = ggml_mul_mat(ctx, k, q);
+    ggml_tensor* attn = ggml_soft_max_ext(
+        ctx, scores, attention_mask, 1.0f, 0.0f);
+    ggml_tensor* attn_out = ggml_mul_mat(ctx, v_perm, attn);
+    attn_out = ggml_cont(
+        ctx, ggml_permute(ctx, attn_out, 0, 2, 1, 3));
+    attn_out = ggml_reshape_3d(ctx, attn_out, dim, T, batch);
+    return linear_with_bias(
+        ctx, attn_out, block.attn_out_w, block.attn_out_b);
+}
+
+ggml_tensor* adaptor_forward_batched(
+    ggml_context* ctx,
+    ggml_tensor* x,
+    ggml_tensor* attention_mask,
+    const AdaptorWeights& weights,
+    const AdaptorConfig& cfg
+) {
+    GGML_ASSERT(ctx && x && attention_mask);
+    GGML_ASSERT(x->ne[1] == attention_mask->ne[0]);
+    GGML_ASSERT(x->ne[1] == attention_mask->ne[1]);
+    GGML_ASSERT(x->ne[2] == attention_mask->ne[3]);
+
+    x = linear_with_bias(ctx, x, weights.linear1_w, weights.linear1_b);
+    x = ggml_relu(ctx, x);
+    x = linear_with_bias(ctx, x, weights.linear2_w, weights.linear2_b);
+
+    for (int i = 0; i < cfg.num_blocks; ++i) {
+        ggml_tensor* residual = x;
+        ggml_tensor* normalized = adaptor_layer_norm(
+            ctx, x, weights.blocks[i].norm1_w, weights.blocks[i].norm1_b);
+        ggml_tensor* attention = adaptor_attention_forward_batched(
+            ctx, normalized, attention_mask, weights.blocks[i], cfg);
+        x = ggml_add(ctx, residual, attention);
+
+        residual = x;
+        normalized = adaptor_layer_norm(
+            ctx, x, weights.blocks[i].norm2_w, weights.blocks[i].norm2_b);
+        ggml_tensor* ffn = linear_with_bias(
+            ctx, normalized, weights.blocks[i].ffn_w1,
+            weights.blocks[i].ffn_b1);
+        ffn = ggml_relu(ctx, ffn);
+        ffn = linear_with_bias(
+            ctx, ffn, weights.blocks[i].ffn_w2,
+            weights.blocks[i].ffn_b2);
+        x = ggml_add(ctx, residual, ffn);
+    }
+    return x;
+}
+
 } // namespace funasr

@@ -14,6 +14,12 @@
 
 namespace funasr {
 
+struct GPUPackedPrefillLayout {
+    int row_offset = 0;
+    int token_count = 0;
+    int n_past = 0;
+};
+
 // GPU GQA Attention with KV Cache (ggml_cpy 方式)
 ggml_tensor* gpu_gqa_forward(
     ggml_context* ctx,
@@ -146,6 +152,26 @@ ggml_tensor* gpu_llm_forward_paged_batch_decode(
     ggml_tensor** block_table_input,
     ggml_tensor** position_input,
     ggml_tensor** kv_lens_input
+);
+
+ggml_tensor* gpu_llm_forward_paged_packed(
+    ggml_context* ctx,
+    ggml_tensor* hidden_states,
+    const GPULLMWeights& weights,
+    GPUKVCache& cache,
+    int max_blocks,
+    int block_size,
+    int graph_max_n_kv,
+    int selected_row_count,
+    const std::vector<GPUPackedPrefillLayout>& prefill_layouts,
+    const LLMConfig& cfg,
+    std::vector<ggml_tensor*>& kv_write_ops,
+    ggml_tensor** block_table_input,
+    ggml_tensor** position_input,
+    ggml_tensor** kv_lens_input,
+    ggml_tensor** selected_rows_input,
+    std::vector<ggml_tensor*>& prefill_past_row_inputs,
+    std::vector<ggml_tensor*>& prefill_mask_inputs
 );
 
 } // namespace funasr

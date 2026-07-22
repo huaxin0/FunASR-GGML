@@ -482,3 +482,37 @@ git commit -m "feat: validate sequential chunked paged prefill"
 - One-shot 与 128-token sequential chunked prefill 的逐 chunk 输出一致。
 - 默认 `prefill_chunk_tokens=0`，现有 benchmark 行为和性能不变。
 - 只有达到这些门槛后，才进入 Packed Mixed Runner 和 Varlen Paged Attention。
+
+## 2026-07-21 GPU 验证结果
+
+Sequential executor 的资源与位置语义已通过真实 RTX 4070 Laptop GPU 验证：
+
+```text
+one-shot, 24 chunks: ok=24/24, final_free=128/128
+chunk=256, 24 chunks: ok=24/24, final_free=128/128
+prompt embedding pool: free=12/12
+ownership_errors=0
+```
+
+但逐请求 token 审计显示，默认 Q8/MMQ + FlashAttention 路径中有 `7/24`
+个请求与 one-shot 输出分叉。关闭 MMQ Stream-K 后仍有 `4/24` 个请求分叉，
+说明差异不只来自 Stream-K，而是不同 Prefill shape 触发不同 CUDA reduction / kernel
+路径后产生的浮点非结合性。4-chunk 小样本曾出现完全一致，因此小样本 exact match
+不足以证明普遍等价。
+
+同一个 `chunk=256` 配置连续执行两轮时，24 个请求逐 token 比较为 `0/24`
+mismatch，wall 分别为 `6.955s` 和 `7.004s`。这支持“确定性的 shape-dependent
+数值漂移”，而不是明显的未初始化内存或并发 race。后续 mixed runner 仍需在首次
+分叉点记录 top1/top2 margin 和 logits `max_abs/max_rel`，完成最终数值归因。
+
+本阶段的结论是：
+
+- KV block、position、embedding 生命周期和失败回收语义通过；
+- sequential chunked prefill 是 reference executor，不是性能实现；
+- “任意 chunk shape 与 one-shot 逐 token 完全一致”不再作为单独的逻辑正确性证明；
+- 后续仍保留 exact mismatch 审计，同时增加同配置重复确定性、logits 数值误差和
+  ASR 文本质量指标；
+- 默认 `prefill_chunk_tokens=0` 保持不变，不能宣称该实验路径已经提高性能。
+
+因此原阶段门槛中的 bitwise 要求记录为未满足，并由下一阶段的分层正确性门槛
+替代，而不是删除失败证据。
